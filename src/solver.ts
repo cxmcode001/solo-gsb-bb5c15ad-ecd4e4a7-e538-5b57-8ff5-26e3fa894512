@@ -2514,3 +2514,417 @@ export function planClosureRoute(query: ClosureRouteQuery): ClosureRouteResult {
     totalMinutes: total,
   };
 }
+
+// ============ 应急送水站布点 ============
+
+/** 应急送水站候选路点数量上限 */
+export const MAX_EMERGENCY_STATIONS = 8;
+
+/** 应急送水站布点查询。 */
+export interface EmergencyStationQuery {
+  /** 管网拓扑（仅用于供水能力核验；测算不修改它） */
+  network: Network;
+  /** 供水能力核验同一模型的查询（供给上限 / 出口需求；重点类别不参与） */
+  capacity: CapacityQuery;
+  /** 作业通道（步行网络，与关阀作业路线共用同一 JSON 模型） */
+  passage: WorkPassage;
+  /** 候选送水站所在路点（去重后不得超过 MAX_EMERGENCY_STATIONS 个） */
+  candidates: string[];
+  /** 每个送水站的可送水量（非负整数），各站统一上限 */
+  stationCapacity: number;
+  /** 最大步行分钟（正整数）：站点到出口路点的最短步行距离不超过该值才可服务 */
+  maxMinutes: number;
+  /** 保供出口名称 -> 该出口的取水路点（只需覆盖存在缺口的出口） */
+  outletWaypoints: Record<string, string>;
+}
+
+/** 入选送水站对单个出口的整数送水分配。 */
+export interface EmergencyAllocation {
+  station: string;
+  outlet: string;
+  /** 该站送到该出口的水量（正整数） */
+  amount: number;
+  /** 站点路点到该出口取水路点的最短步行分钟（不超过最大步行分钟） */
+  minutes: number;
+}
+
+/** 一个入选送水站的送水明细。 */
+export interface EmergencyStationRow {
+  station: string;
+  /** 可送水量上限 */
+  capacity: number;
+  /** 该站实际送出水量合计 */
+  delivered: number;
+  /** 该站在选定步行限额下可服务的出口（名称升序） */
+  serviceableOutlets: string[];
+  /** 逐出口实际送水量（按出口名称升序） */
+  allocations: EmergencyAllocation[];
+}
+
+/** 一个存在缺口的出口的补齐情况（无解时给出未补齐量）。 */
+export interface EmergencyOutletRow {
+  outlet: string;
+  /** 该出口取水路点 */
+  waypoint: string;
+  /** 供水能力核验得出的缺口（待送水量） */
+  shortfall: number;
+  /** 方案中各站送到该出口的水量合计 */
+  delivered: number;
+  /** 未补齐量 = 缺口 - 送到位量；0 表示已补齐 */
+  remaining: number;
+}
+
+export interface EmergencyStationOk {
+  status: 'ok';
+  /** 候选送水站（去重后按名称升序） */
+  candidates: string[];
+  /** 各出口待送水量（即供水能力核验的缺口，按填写表顺序） */
+  shortfalls: { outlet: string; shortfall: number }[];
+  /** 总待送水量（缺口合计） */
+  totalShortfall: number;
+  /** 最大步行分钟 */
+  maxMinutes: number;
+  /** 入选站点（名称升序列表；站数最少、同数按列表字典序最小） */
+  stations: string[];
+  /** 入选站点数 */
+  stationCount: number;
+  /** 每站可送水量 */
+  stationCapacity: number;
+  /** 逐站明细（按站点名称升序） */
+  stationRows: EmergencyStationRow[];
+  /** 逐出口补齐明细（按填写表顺序） */
+  outletRows: EmergencyOutletRow[];
+  /** 总补齐量（= 总待送水量，全部缺口均已补齐） */
+  totalDelivered: number;
+}
+
+/** 缺口全为 0：无需布点。 */
+export interface EmergencyStationEmpty {
+  status: 'empty';
+  reason: string;
+}
+
+/** 任意站点子集都无法补齐全部缺口。 */
+export interface EmergencyStationNoSolution {
+  status: 'no-solution';
+  /** 候选送水站（去重后按名称升序） */
+  candidates: string[];
+  /** 最大步行分钟 */
+  maxMinutes: number;
+  /** 每站可送水量 */
+  stationCapacity: number;
+  /** 总待送水量 */
+  totalShortfall: number;
+  /** 全部候选站都启用时最多能补齐的水量 */
+  bestDelivered: number;
+  /** 逐出口补齐情况（按填写表顺序，含未补齐量） */
+  outletRows: EmergencyOutletRow[];
+  /** 未能补齐（remaining > 0）的出口名称（按名称升序） */
+  unmetOutlets: string[];
+  reason: string;
+}
+
+export interface EmergencyStationInvalid {
+  status: 'invalid';
+  errors: string[];
+}
+
+export type EmergencyStationResult =
+  | EmergencyStationOk
+  | EmergencyStationEmpty
+  | EmergencyStationNoSolution
+  | EmergencyStationInvalid;
+
+/**
+ * 在无向作业通道上求全部路点间最短步行距离（Floyd–Warshall）。
+ * 同名端点间的并行通道取最小分钟；返回 Infinity 表示无路可达。
+ */
+function passageShortestPaths(passage: WorkPassage): {
+  dist: number[][];
+  idxOf: Map<string, number>;
+} {
+  const m = passage.waypoints.length;
+  const idxOf = new Map<string, number>();
+  passage.waypoints.forEach((wp, i) => idxOf.set(wp, i));
+  const dist: number[][] = Array.from({ length: m }, () => new Array(m).fill(Infinity));
+  for (let i = 0; i < m; i++) dist[i][i] = 0;
+  for (const e of passage.passages) {
+    const u = idxOf.get(e.from)!;
+    const v = idxOf.get(e.to)!;
+    if (u === v) continue; // 自环对正权最短通行距离无意义
+    if (e.minutes < dist[u][v]) {
+      dist[u][v] = e.minutes;
+      dist[v][u] = e.minutes;
+    }
+  }
+  for (let k = 0; k < m; k++) {
+    for (let i = 0; i < m; i++) {
+      if (dist[i][k] === Infinity) continue;
+      for (let j = 0; j < m; j++) {
+        const via = dist[i][k] + dist[k][j];
+        if (via < dist[i][j]) dist[i][j] = via;
+      }
+    }
+  }
+  return { dist, idxOf };
+}
+
+/**
+ * 应急送水站布点：沿用当前管网拓扑、阀门登记状态、供水能力填写表与作业通道，
+ * 先以「供水能力核验」得出的各出口缺口作为待送水量；用户给出候选送水站路点
+ * （最多 MAX_EMERGENCY_STATIONS 个）、每站可送水量、最大步行分钟与出口到取水路点
+ * 的映射。按作业通道最短步行距离建立「站点 → 出口」可服务关系（不超过最大步行
+ * 分钟才可达），枚举站点子集并用容量流分配整数送水量，选出能补齐全部缺口且
+ * 站数最少的方案，同数按站点名称升序列表的字典序取舍。
+ *
+ * 容量流网络：超级源点 → 站点（容量为每站可送水量）→ 缺口出口（容量为该出口
+ * 缺口，仅在可服务时连弧）→ 超级汇点；最大流等于全部缺口即该子集可行。
+ * 缺口全为 0 时返回 empty（无需布点）；任何子集都不可行时返回 no-solution，
+ * 给出全部站启用仍未补齐的出口。纯函数测算：不修改管网拓扑、阀门登记状态、
+ * 供水能力数值与作业通道输入。
+ */
+export function planEmergencyStations(query: EmergencyStationQuery): EmergencyStationResult {
+  const errors: string[] = [];
+  const { network, capacity, passage } = query;
+
+  // 候选路点：字符串数组、去重、须在作业通道 waypoints 中声明、数量受限
+  if (!Array.isArray(query.candidates)) {
+    errors.push('候选送水站路点必须是数组（多个路点名称）。');
+  }
+  const rawCandidates = Array.isArray(query.candidates) ? query.candidates : [];
+  const candidateNames: string[] = [];
+  for (const c of rawCandidates) {
+    if (typeof c !== 'string' || !c.trim()) {
+      errors.push('候选送水站路点必须是非空字符串。');
+      continue;
+    }
+    const name = c.trim();
+    if (!passage.waypoints.includes(name)) {
+      errors.push(`候选送水站路点「${name}」不在作业通道的 waypoints 中。`);
+    }
+    candidateNames.push(name);
+  }
+  const candidates = uniquePreservingOrder(candidateNames);
+  if (candidates.length === 0) errors.push('请至少填写一个候选送水站路点。');
+  if (candidates.length > MAX_EMERGENCY_STATIONS) {
+    errors.push(
+      `候选送水站有 ${candidates.length} 个，超过上限 ${MAX_EMERGENCY_STATIONS} 个；请精简候选名单后再布点。`
+    );
+  }
+
+  // 每站可送水量：非负整数（0 时任何站都无法送水，最终表现为无解）
+  if (typeof query.stationCapacity !== 'number' ||
+      !Number.isSafeInteger(query.stationCapacity) || query.stationCapacity < 0) {
+    errors.push(`每站可送水量必须是非负整数（收到：${String(query.stationCapacity)}）。`);
+  }
+  // 最大步行分钟：正整数（站点与出口路点相同距离为 0，故限额须 ≥ 1）
+  if (typeof query.maxMinutes !== 'number' ||
+      !Number.isSafeInteger(query.maxMinutes) || query.maxMinutes <= 0) {
+    errors.push(`最大步行分钟必须是正整数（收到：${String(query.maxMinutes)}）。`);
+  }
+
+  // 出口到取水路点的映射：必须是对象，值须为已声明路点
+  if (!isRecord(query.outletWaypoints)) {
+    errors.push('出口到路点的映射必须是对象：键为保供出口名称，值为该出口的取水路点。');
+  }
+  const outletWaypoints: Record<string, string> = {};
+  if (isRecord(query.outletWaypoints)) {
+    for (const [outlet, wp] of Object.entries(query.outletWaypoints)) {
+      if (!outlet) {
+        errors.push('出口到路点的映射中存在空的出口名称键。');
+        continue;
+      }
+      if (typeof wp !== 'string' || !wp.trim()) {
+        errors.push(`出口「${outlet}」对应的取水路点必须是非空字符串。`);
+        continue;
+      }
+      if (!passage.waypoints.includes(wp.trim())) {
+        errors.push(`出口「${outlet}」对应的取水路点「${wp.trim()}」未在作业通道的 waypoints 中声明。`);
+        continue;
+      }
+      outletWaypoints[outlet] = wp.trim();
+    }
+  }
+  if (errors.length > 0) return { status: 'invalid', errors };
+
+  // 待送水量：直接取「供水能力核验」各出口缺口（同一模型、同一填写表）
+  const capacityResult = verifyCapacity(network, capacity);
+  if (capacityResult.status === 'invalid') {
+    return { status: 'invalid', errors: capacityResult.errors };
+  }
+  const gapRows = capacityResult.rows.map((r) => ({ outlet: r.outlet, shortfall: r.shortfall }));
+  const totalShortfall = gapRows.reduce((sum, g) => sum + g.shortfall, 0);
+  if (totalShortfall === 0) {
+    return {
+      status: 'empty',
+      reason:
+        '无需布点：按当前供水能力填写表核验，全部保供出口均已足额获配（各出口缺口均为 0），' +
+        '不必设置应急送水站。',
+    };
+  }
+
+  // 存在缺口的出口必须提供取水路点映射，且出口名称须来自填写表
+  const gapOutlets = new Set(gapRows.filter((g) => g.shortfall > 0).map((g) => g.outlet));
+  const knownOutlets = new Set(capacityResult.rows.map((r) => r.outlet));
+  for (const outlet of Object.keys(outletWaypoints)) {
+    if (!knownOutlets.has(outlet)) {
+      errors.push(`映射中的出口「${outlet}」不在供水能力填写表的保供出口名单中。`);
+    }
+  }
+  for (const outlet of gapOutlets) {
+    if (outletWaypoints[outlet] === undefined) {
+      errors.push(`出口「${outlet}」存在缺口 ${gapRows.find((g) => g.outlet === outlet)!.shortfall}，请在出口到路点的映射中提供其取水路点。`);
+    }
+  }
+  if (errors.length > 0) return { status: 'invalid', errors };
+
+  // 站点按名称升序：子集枚举按此顺序生成，同站数首个可行子集即名称列表字典序最小
+  const stations = [...candidates].sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
+  const { dist, idxOf } = passageShortestPaths(passage);
+  const activeGaps = gapRows.filter((g) => g.shortfall > 0);
+
+  /** serviceable[s][o] = 站点 s 到出口 o 取水路点的最短步行分钟；null 表示不可服务。 */
+  const serviceable: (number | null)[][] = stations.map((station) => {
+    const si = idxOf.get(station)!;
+    return activeGaps.map((g) => {
+      const wi = idxOf.get(outletWaypoints[g.outlet])!;
+      const d = dist[si][wi];
+      return d !== Infinity && d <= query.maxMinutes ? d : null;
+    });
+  });
+
+  /**
+   * 对给定站点子集建立容量流并求最大送水量；返回总送水量、各弧流量与
+   * 站点-出口可服务出口列表。节点：0..nS-1 站点，nS..nS+nO-1 出口，
+   * 超级源点 nS+nO，超级汇点 nS+nO+1。
+   */
+  const evaluateSubset = (
+    chosen: number[]
+  ): { flow: number; pairFlow: number[][]; deliveredByOutlet: number[] } => {
+    const nS = chosen.length;
+    const nO = activeGaps.length;
+    const S = nS + nO;
+    const T = S + 1;
+    const dinic = new CapacityDinic(nS + nO);
+    for (let i = 0; i < nS; i++) dinic.addArc(S, i, query.stationCapacity);
+    const pairArc: number[][] = Array.from({ length: nS }, () => new Array(nO).fill(-1));
+    chosen.forEach((s, i) => {
+      for (let j = 0; j < nO; j++) {
+        const minutes = serviceable[s][j];
+        if (minutes === null) continue;
+        pairArc[i][j] = dinic.addArc(i, nS + j, activeGaps[j].shortfall);
+      }
+    });
+    for (let j = 0; j < nO; j++) dinic.addArc(nS + j, T, activeGaps[j].shortfall);
+    const flow = dinic.maxFlow(S, T);
+    const pairFlow = pairArc.map((row) => row.map((a) => (a === -1 ? 0 : dinic.arcFlow(a))));
+    const deliveredByOutlet = new Array(nO).fill(0);
+    for (let i = 0; i < nS; i++) {
+      for (let j = 0; j < nO; j++) deliveredByOutlet[j] += pairFlow[i][j];
+    }
+    return { flow, pairFlow, deliveredByOutlet };
+  };
+
+  const n = stations.length;
+  const allIndices = Array.from({ length: n }, (_, i) => i);
+  const allEval = evaluateSubset(allIndices);
+
+  // 全部候选站启用仍无法补齐：无解，按「全部站启用」的最大流给出未补齐出口
+  if (allEval.flow < totalShortfall) {
+    const outletRows: EmergencyOutletRow[] = activeGaps.map((g, j) => ({
+      outlet: g.outlet,
+      waypoint: outletWaypoints[g.outlet],
+      shortfall: g.shortfall,
+      delivered: allEval.deliveredByOutlet[j],
+      remaining: g.shortfall - allEval.deliveredByOutlet[j],
+    }));
+    const unmetOutlets = outletRows
+      .filter((r) => r.remaining > 0)
+      .map((r) => r.outlet)
+      .sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
+    return {
+      status: 'no-solution',
+      candidates: stations,
+      maxMinutes: query.maxMinutes,
+      stationCapacity: query.stationCapacity,
+      totalShortfall,
+      bestDelivered: allEval.flow,
+      outletRows,
+      unmetOutlets,
+      reason:
+        `即使启用全部 ${n} 个候选送水站，最多也只能补齐 ${allEval.flow} / ${totalShortfall} 的待送水量：` +
+        `出口 ${unmetOutlets.map((o) => `「${o}」`).join('、')} 仍有缺口，无法补齐全部缺口。` +
+        '请增设可在最大步行分钟内到达这些出口的候选路点、提高每站可送水量或放宽最大步行分钟。',
+    };
+  }
+
+  // 按站数 k = 0,1,… 枚举子集；同 k 下组合按站点（名称升序）下标字典序生成
+  let chosen: number[] = [];
+  let chosenEval: { flow: number; pairFlow: number[][]; deliveredByOutlet: number[] } | null = null;
+  for (let k = 1; k <= n; k++) {
+    const idx = Array.from({ length: k }, (_, i) => i);
+    while (true) {
+      const subset = idx.map((i) => i);
+      const ev = evaluateSubset(subset);
+      if (ev.flow >= totalShortfall) {
+        chosen = subset;
+        chosenEval = ev;
+        break;
+      }
+      let i = k - 1;
+      while (i >= 0 && idx[i] === n - k + i) i--;
+      if (i < 0) break;
+      idx[i]++;
+      for (let j = i + 1; j < k; j++) idx[j] = idx[j - 1] + 1;
+    }
+    if (chosenEval) break;
+  }
+
+  const ev = chosenEval!;
+  const stationRows: EmergencyStationRow[] = chosen.map((s, i) => {
+    const allocations: EmergencyAllocation[] = [];
+    const serviceableOutlets: string[] = [];
+    activeGaps.forEach((g, j) => {
+      if (serviceable[s][j] !== null) serviceableOutlets.push(g.outlet);
+      if (ev.pairFlow[i][j] > 0) {
+        allocations.push({
+          station: stations[s],
+          outlet: g.outlet,
+          amount: ev.pairFlow[i][j],
+          minutes: serviceable[s][j]!,
+        });
+      }
+    });
+    serviceableOutlets.sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
+    allocations.sort((a, b) => a.outlet.localeCompare(b.outlet, 'zh-Hans-CN'));
+    return {
+      station: stations[s],
+      capacity: query.stationCapacity,
+      delivered: allocations.reduce((sum, a) => sum + a.amount, 0),
+      serviceableOutlets,
+      allocations,
+    };
+  }).sort((a, b) => a.station.localeCompare(b.station, 'zh-Hans-CN'));
+
+  const outletRows: EmergencyOutletRow[] = activeGaps.map((g, j) => ({
+    outlet: g.outlet,
+    waypoint: outletWaypoints[g.outlet],
+    shortfall: g.shortfall,
+    delivered: ev.deliveredByOutlet[j],
+    remaining: g.shortfall - ev.deliveredByOutlet[j],
+  }));
+
+  return {
+    status: 'ok',
+    candidates: stations,
+    shortfalls: gapRows,
+    totalShortfall,
+    maxMinutes: query.maxMinutes,
+    stations: chosen.map((s) => stations[s]),
+    stationCount: chosen.length,
+    stationCapacity: query.stationCapacity,
+    stationRows,
+    outletRows,
+    totalDelivered: ev.flow,
+  };
+}

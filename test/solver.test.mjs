@@ -1314,5 +1314,235 @@ check('路线测算不修改拓扑', JSON.stringify(routeNet) === beforeRouteNet
 check('路线测算不修改作业通道输入', JSON.stringify(passage) === beforeRoutePsg);
 check('路线测算不修改待关闭阀门入参数组', closedInput.join(',') === 'V2,V1');
 
+// ============ 应急送水站布点 ============
+console.log('应急送水站布点：');
+
+// 供水网络：S1 经两条单位容量路径分别供 A、B；上限 10、需求各 2，
+// 每条支管容量 1，故 A、B 各最多获配 1 → 各缺 1（共待送 2）。
+const emNet = {
+  nodes: ['S1', 'N1', 'A', 'B'],
+  pipes: [
+    { id: 'P1', from: 'N1', to: 'A' },
+    { id: 'P2', from: 'N1', to: 'B' },
+  ],
+  valvedPipes: [
+    { id: 'V1', from: 'S1', to: 'N1', open: true },
+    { id: 'V2', from: 'S1', to: 'N1', open: true },
+  ],
+};
+const emCapacity = {
+  supplies: ['S1'],
+  outlets: ['A', 'B'],
+  supplyCaps: { S1: 10 },
+  outletDemands: { A: 2, B: 2 },
+};
+// 步行网络：s1—A点 1 分钟，s1—B点 3 分钟；s2—A点 3、s2—B点 1；s3 与 s1 对称（s3-A=1, s3-B=3）
+const emPassage = {
+  waypoints: ['s1', 's2', 's3', 'wA', 'wB'],
+  passages: [
+    { from: 's1', to: 'wA', minutes: 1 },
+    { from: 's1', to: 'wB', minutes: 3 },
+    { from: 's2', to: 'wA', minutes: 3 },
+    { from: 's2', to: 'wB', minutes: 1 },
+    { from: 's3', to: 'wA', minutes: 1 },
+    { from: 's3', to: 'wB', minutes: 3 },
+  ],
+  valveWaypoints: {},
+};
+const emOutletWaypoints = { A: 'wA', B: 'wB' };
+const emPlan = (overrides = {}) =>
+  solver.planEmergencyStations({
+    network: emNet,
+    capacity: emCapacity,
+    passage: emPassage,
+    candidates: ['s1', 's2', 's3'],
+    stationCapacity: 2,
+    maxMinutes: 2,
+    outletWaypoints: emOutletWaypoints,
+    ...overrides,
+  });
+
+const em1 = emPlan();
+check('返回 ok', em1.status === 'ok');
+check('总待送水量为 2（A、B 各缺 1）', em1.status === 'ok' && em1.totalShortfall === 2);
+check('限额 2 分钟内单站只能服务一个出口，最少站数为 2', em1.status === 'ok' && em1.stationCount === 2);
+check('同数按站点名称升序列表字典序取 [s1,s2]',
+  em1.status === 'ok' && em1.stations.join(',') === 's1,s2');
+check('总补齐量 = 总待送水量 2', em1.status === 'ok' && em1.totalDelivered === 2);
+check('逐出口送水量：A 得 1、B 得 1（站点明细之和）',
+  em1.status === 'ok' &&
+  em1.outletRows.find((o) => o.outlet === 'A').delivered === 1 &&
+  em1.outletRows.find((o) => o.outlet === 'B').delivered === 1);
+check('s1 与 s2 各实送 1（容量 2 但各仅一个限额内出口有缺口）',
+  em1.status === 'ok' &&
+  em1.stationRows.find((r) => r.station === 's1').delivered === 1 &&
+  em1.stationRows.find((r) => r.station === 's2').delivered === 1);
+check('步行分钟记录正确（s1→A 为 1 分钟、s2→B 为 1 分钟）',
+  em1.status === 'ok' &&
+  em1.stationRows.find((r) => r.station === 's1').allocations[0].minutes === 1 &&
+  em1.stationRows.find((r) => r.station === 's2').allocations[0].minutes === 1);
+check('可服务关系正确（限额 2 分钟内 s1 只可服务 A）',
+  em1.status === 'ok' &&
+  em1.stationRows.find((r) => r.station === 's1').serviceableOutlets.join(',') === 'A');
+check('全部出口未补齐量为 0',
+  em1.status === 'ok' && em1.outletRows.every((o) => o.remaining === 0 && o.delivered === o.shortfall));
+const em1b = emPlan({ maxMinutes: 5 });
+check('限额放宽到 5 分钟时 s1 可同时服务 A、B，但容量 2 恰好补齐 → 单站即可',
+  em1b.status === 'ok' && em1b.stationCount === 1 && em1b.stations[0] === 's1' &&
+  em1b.stationRows[0].delivered === 2);
+
+console.log('应急送水站布点：每站容量约束（容量 1 时必须各送各的）：');
+const em2 = emPlan({ stationCapacity: 1 });
+check('容量 1 仍需 2 站且每站实送 1',
+  em2.status === 'ok' && em2.stationCount === 2 &&
+  em2.stationRows.every((r) => r.delivered === 1));
+
+console.log('应急送水站布点：容量流在同站服务多出口时按整数分配：');
+// A 缺 2、B 缺 1；s1 同时可服务两者、容量 2，s2 仅可服务 B
+const capNet = {
+  nodes: ['S1', 'N1', 'A', 'B'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S1', to: 'A', open: true },
+    { id: 'V2', from: 'S1', to: 'B', open: true },
+  ],
+};
+const capCapacity = {
+  supplies: ['S1'], outlets: ['A', 'B'],
+  supplyCaps: { S1: 0 }, outletDemands: { A: 2, B: 1 },
+};
+const capPsg = {
+  // s1 分别 1 分钟直达 wA、wB；s2 仅 1 分钟直达 wB（s2 绕行 wB→s1→wA 需 3 分钟，
+  // 限额 1 分钟时 s2 只能服务 B）
+  waypoints: ['s1', 's2', 'wA', 'wB'],
+  passages: [
+    { from: 's1', to: 'wA', minutes: 1 },
+    { from: 's1', to: 'wB', minutes: 1 },
+    { from: 's2', to: 'wB', minutes: 1 },
+  ],
+  valveWaypoints: {},
+};
+const em3 = solver.planEmergencyStations({
+  network: capNet, capacity: capCapacity, passage: capPsg,
+  candidates: ['s1', 's2'], stationCapacity: 2, maxMinutes: 1,
+  outletWaypoints: { A: 'wA', B: 'wB' },
+});
+check('供给上限 0 时全部需求转为缺口（总待送 3）', em3.totalShortfall === 3);
+check('s1 容量 2 须全给 A、s2 补 B=1，共 2 站（s2 绕行到 A 需 3 分钟超限额）',
+  em3.status === 'ok' && em3.stationCount === 2 &&
+  em3.stationRows.find((r) => r.station === 's1').delivered === 2 &&
+  em3.stationRows.find((r) => r.station === 's2').delivered === 1 &&
+  em3.outletRows.find((o) => o.outlet === 'A').delivered === 2);
+// s1 单站容量 2 无法补齐 3 → 容量 3 时单站即可（A=2、B=1 均在限额内）
+const em3b = solver.planEmergencyStations({
+  network: capNet, capacity: capCapacity, passage: capPsg,
+  candidates: ['s1', 's2'], stationCapacity: 3, maxMinutes: 1,
+  outletWaypoints: { A: 'wA', B: 'wB' },
+});
+check('容量 3 时 s1 单站补齐全部（最少 1 站，选字典序首个可行站 s1）',
+  em3b.status === 'ok' && em3b.stationCount === 1 && em3b.stations[0] === 's1');
+
+console.log('应急送水站布点：最大步行分钟过滤可服务关系：');
+const em4 = emPlan({ maxMinutes: 2 });
+check('限额 2 分钟时 s1 只服务 A、s2 只服务 B，仍需 2 站',
+  em4.status === 'ok' && em4.stationCount === 2 &&
+  em4.stationRows.find((r) => r.station === 's1').serviceableOutlets.join('') === 'A');
+const em4b = emPlan({ maxMinutes: 0 });
+check('限额必须为正整数（0 被拒绝）', em4b.status === 'invalid' &&
+  em4b.errors.some((e) => e.includes('正整数')));
+
+console.log('应急送水站布点：无路可达的取水路点（距离为 Infinity）：');
+const islandPsg2 = {
+  waypoints: ['s1', 'wA', '孤岛'],
+  passages: [{ from: 's1', to: 'wA', minutes: 1 }],
+  valveWaypoints: {},
+};
+const em5 = solver.planEmergencyStations({
+  network: emNet, capacity: emCapacity, passage: islandPsg2,
+  candidates: ['s1'], stationCapacity: 5, maxMinutes: 50,
+  outletWaypoints: { A: 'wA', B: '孤岛' },
+});
+check('B 的取水路点不可达 → 无解，B 列为未补齐出口',
+  em5.status === 'no-solution' && em5.unmetOutlets.join(',') === 'B' &&
+  em5.bestDelivered === 1 &&
+  em5.outletRows.find((o) => o.outlet === 'B').remaining === 1);
+
+console.log('应急送水站布点：缺口全为 0：');
+const fullCapacity = {
+  supplies: ['S1'], outlets: ['A', 'B'],
+  supplyCaps: { S1: 10 }, outletDemands: { A: 1, B: 1 },
+};
+const em6 = emPlan({ capacity: fullCapacity });
+check('返回 empty（无需布点）', em6.status === 'empty');
+
+console.log('应急送水站布点：输入校验：');
+const em7a = emPlan({ candidates: ['s1', 's2', 's3', 'x'] });
+check('候选路点未声明被拒绝', em7a.status === 'invalid' && em7a.errors.some((e) => e.includes('x')));
+const em7b = emPlan({
+  candidates: ['s1', 's1', 's2', 's3', 'wA', 'wB', 's1', 'wA', 'x', 'y', 'p', 'q'],
+  passage: {
+    waypoints: ['s1', 's2', 's3', 'wA', 'wB', 'x', 'y', 'p', 'q'],
+    passages: [
+      { from: 's1', to: 'wA', minutes: 1 },
+      { from: 's1', to: 'wB', minutes: 3 },
+      { from: 's2', to: 'wA', minutes: 3 },
+      { from: 's2', to: 'wB', minutes: 1 },
+      { from: 's3', to: 'wA', minutes: 1 },
+    ],
+    valveWaypoints: {},
+  },
+});
+check('超过 8 个候选被拒绝（去重后 9 个仍超限）', em7b.status === 'invalid' &&
+  em7b.errors.some((e) => e.includes('8')));
+const em7c = emPlan({ candidates: [] });
+check('候选为空被拒绝', em7c.status === 'invalid');
+const em7d = emPlan({ stationCapacity: -1 });
+check('负的可送水量被拒绝', em7d.status === 'invalid');
+const em7e = emPlan({ stationCapacity: 1.5 });
+check('小数可送水量被拒绝', em7e.status === 'invalid');
+const em7f = emPlan({ outletWaypoints: { A: 'wA' } });
+check('缺口出口缺少取水路点映射被拒绝（指出 B）',
+  em7f.status === 'invalid' && em7f.errors.some((e) => e.includes('B')));
+const em7g = emPlan({ outletWaypoints: { A: 'wA', B: '不存在' } });
+check('映射路点未声明被拒绝', em7g.status === 'invalid' && em7g.errors.some((e) => e.includes('不存在')));
+const em7h = emPlan({ outletWaypoints: { A: 'wA', B: 'wB', Z: 'wA' } });
+check('映射中出现名单外出口被拒绝', em7h.status === 'invalid' && em7h.errors.some((e) => e.includes('Z')));
+const em7i = emPlan({ outletWaypoints: 'nope' });
+check('映射非对象被拒绝', em7i.status === 'invalid');
+// 零缺口出口不必提供映射
+const em7j = emPlan({ capacity: fullCapacity, outletWaypoints: {} });
+check('缺口全为 0 时无需任何出口映射（empty）', em7j.status === 'empty');
+
+console.log('应急送水站布点：站数最少与中文字典序：');
+// 三个候选都能补齐全部缺口（s9 容量足够、限额 50），应只取 1 站且字典序最小
+const em8 = solver.planEmergencyStations({
+  network: capNet, capacity: capCapacity, passage: {
+    waypoints: ['站点甲', '站点乙', '站点丙', 'wA', 'wB'],
+    passages: [
+      { from: '站点甲', to: 'wA', minutes: 1 }, { from: '站点甲', to: 'wB', minutes: 1 },
+      { from: '站点乙', to: 'wA', minutes: 1 }, { from: '站点乙', to: 'wB', minutes: 1 },
+      { from: '站点丙', to: 'wA', minutes: 1 }, { from: '站点丙', to: 'wB', minutes: 1 },
+    ],
+    valveWaypoints: {},
+  },
+  candidates: ['站点丙', '站点甲', '站点乙'], stationCapacity: 5, maxMinutes: 5,
+  outletWaypoints: { A: 'wA', B: 'wB' },
+});
+check('均可单站补齐时只取 1 站', em8.stationCount === 1);
+// 名称升序列表字典序按 zh-Hans-CN（拼音 丙 bing < 甲 jia < 乙 yi），最小者为「站点丙」
+check('同数按中文站点名称升序取拼音序最小者「站点丙」', em8.stations[0] === '站点丙');
+
+console.log('应急送水站布点：纯函数：');
+const beforeEmNet = JSON.stringify(emNet);
+const beforeEmPsg = JSON.stringify(emPassage);
+const beforeEmCapacity = JSON.stringify(emCapacity);
+const emCandidates = ['s1', 's2', 's3'];
+const emMap = { A: 'wA', B: 'wB' };
+emPlan();
+check('布点测算不修改管网拓扑', JSON.stringify(emNet) === beforeEmNet);
+check('布点测算不修改作业通道', JSON.stringify(emPassage) === beforeEmPsg);
+check('布点测算不修改供给 / 需求数值', JSON.stringify(emCapacity) === beforeEmCapacity);
+check('布点测算不修改候选与映射入参', emCandidates.join(',') === 's1,s2,s3' && JSON.stringify(emMap) === JSON.stringify({ A: 'wA', B: 'wB' }));
+
 console.log(`\n${passed} 通过, ${failed} 失败`);
 process.exit(failed > 0 ? 1 : 0);

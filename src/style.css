@@ -120,12 +120,17 @@ label {
   color: var(--muted);
 }
 
-input[type='text'] {
+input[type='text'],
+input[type='number'] {
   padding: 8px 10px;
   border: 1px solid var(--border);
   border-radius: 6px;
   font-size: 0.95rem;
   color: var(--text);
+}
+
+.fields input[type='number'] {
+  max-width: 320px;
 }
 
 button {

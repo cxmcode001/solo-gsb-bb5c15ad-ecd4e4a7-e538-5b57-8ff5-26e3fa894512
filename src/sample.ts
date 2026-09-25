@@ -126,3 +126,31 @@ export const SAMPLE_WORK_PASSAGE = {
 
 /** 示例关阀作业路线：出发路点。 */
 export const SAMPLE_ROUTE_START = '检修大门';
+
+/**
+ * 示例应急送水站布点：候选送水站路点（沿用 SAMPLE_WORK_PASSAGE 作业通道）。
+ * 供水能力核验下展厅B、咖啡厅、卫生间各缺 1（共 3）；限额 5 分钟内
+ * 环管N1井位可服务展厅B，环管N3井位可服务咖啡厅与卫生间，S1泵房 / S2水箱间
+ * 只能服务展厅B、检修大门到不了任何缺口出口；单站容量 2 无法补齐 3，
+ * 故最少需 2 站；同数按站点名称升序列表字典序取「环管N1井位 + 环管N3井位」。
+ */
+export const SAMPLE_EMERGENCY_CANDIDATES: string[] = [
+  '环管N1井位',
+  '环管N3井位',
+  'S1泵房',
+  'S2水箱间',
+  '检修大门',
+];
+
+/** 示例应急送水站布点：每个送水站的可送水量。 */
+export const SAMPLE_EMERGENCY_STATION_CAPACITY = 2;
+
+/** 示例应急送水站布点：最大步行分钟。 */
+export const SAMPLE_EMERGENCY_MAX_MINUTES = 5;
+
+/** 示例应急送水站布点：保供出口 -> 取水路点映射（缺口出口均在其中）。 */
+export const SAMPLE_EMERGENCY_OUTLET_WAYPOINTS: Record<string, string> = {
+  展厅B: '展厅B检修口',
+  咖啡厅: '环管N3井位',
+  卫生间: '卫生间检修口',
+};

@@ -12,6 +12,7 @@ import {
   planReopenSequence,
   parseWorkPassage,
   planClosureRoute,
+  planEmergencyStations,
   MAX_OPEN_VALVES,
   EXPANSION_TARGET_CAPACITY,
   MAX_EXPANSION_PIPES,
@@ -20,6 +21,7 @@ import {
   MAX_OBSERVER_CANDIDATES,
   MAX_REOPEN_VALVES,
   MAX_ROUTE_VALVES,
+  MAX_EMERGENCY_STATIONS,
   type Query,
   type CapacityQuery,
   type AnomalyQuery,
@@ -37,6 +39,7 @@ import {
   type ObserverPlanResult,
   type ObserverHypothesis,
   type ReopenResult,
+  type EmergencyStationResult,
 } from './solver';
 import {
   SAMPLE_NETWORK,
@@ -49,6 +52,10 @@ import {
   SAMPLE_OBSERVER_CANDIDATES,
   SAMPLE_WORK_PASSAGE,
   SAMPLE_ROUTE_START,
+  SAMPLE_EMERGENCY_CANDIDATES,
+  SAMPLE_EMERGENCY_STATION_CAPACITY,
+  SAMPLE_EMERGENCY_MAX_MINUTES,
+  SAMPLE_EMERGENCY_OUTLET_WAYPOINTS,
 } from './sample';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
@@ -71,7 +78,11 @@ app.innerHTML = `
       每步仅开启一个待开阀门，规划使各步开阀后总获配量之和最大的完整开阀顺序），
       并能在选定关阀方案后做「关阀作业路线」（另填路点 / 无向通道 / 步行分钟 / 阀门路点的作业通道 JSON 与出发路点，
       先求路点间最短通行距离，再用子集动态规划求出发并返回、总步行时间最少的完整关阀路线，
-      同分按阀门编号序列字典序取舍，必访阀门最多 ${MAX_ROUTE_VALVES} 个）。
+      同分按阀门编号序列字典序取舍，必访阀门最多 ${MAX_ROUTE_VALVES} 个），
+      还能做「应急送水站布点」（沿用当前拓扑、供水能力填写表与作业通道，以供水能力核验的各出口缺口为待送水量；
+      填写最多 ${MAX_EMERGENCY_STATIONS} 个候选站路点、每站可送水量、最大步行分钟与出口到路点映射，
+      按通道最短步行距离建立站点到出口的可服务关系，枚举站点子集并用容量流分配整数送水量，
+      选能补齐全部缺口且站数最少的方案，同数按站点名称升序列表字典序取舍；缺口全为 0 时提示无需布点）。
       组合搜索最多覆盖 ${MAX_OPEN_VALVES} 个当前开启的阀门；求解过程不修改输入中的阀门状态。
     </p>
   </header>
@@ -204,6 +215,39 @@ app.innerHTML = `
         <button id="plan-closure-route" type="button" class="secondary">规划关阀作业路线</button>
       </div>
       <p class="hint" id="selected-solution-hint">尚未选择方案：请先点击「搜索关阀方案」，再在结果中选择一个方案（默认选择推荐方案）。</p>
+      <h2>7. 应急送水站布点</h2>
+      <p class="hint">
+        沿用当前管网拓扑、阀门登记状态、上方<strong>供水能力填写表</strong>与<strong>作业通道 JSON</strong>：
+        先以「供水能力核验」得出的<strong>各出口缺口</strong>作为待送水量，填写候选送水站路点
+        （最多 ${MAX_EMERGENCY_STATIONS} 个）、<strong>每站可送水量</strong>、<strong>最大步行分钟</strong>与
+        <strong>出口到取水路点的 JSON 映射</strong>。系统按通道最短步行距离建立「站点 → 出口」可服务关系
+        （最短步行分钟不超过最大步行分钟才可服务），枚举站点子集并用容量流分配<strong>整数送水量</strong>，
+        选出能<strong>补齐全部缺口且站数最少</strong>的方案（同数按站点名称升序列表字典序取舍），
+        展示站点、逐出口分配与总补齐量；无解时说明未补齐出口。缺口全为 0 时提示无需布点。
+        测算<strong>不改原始管网及阀门状态</strong>。
+      </p>
+      <div class="fields">
+        <label>
+          候选送水站路点（多个用逗号分隔，最多 ${MAX_EMERGENCY_STATIONS} 个，须在作业通道 waypoints 中）
+          <input id="emergency-candidates" type="text" placeholder="如：环管N1井位, 环管N3井位" />
+        </label>
+        <label>
+          每站可送水量（非负整数，各站统一上限）
+          <input id="emergency-capacity" type="number" min="0" step="1" inputmode="numeric" placeholder="如：2" />
+        </label>
+        <label>
+          最大步行分钟（正整数；站点到出口路点的最短步行距离不超过该值才可服务）
+          <input id="emergency-max-minutes" type="number" min="1" step="1" inputmode="numeric" placeholder="如：5" />
+        </label>
+      </div>
+      <label>
+        出口到取水路点的 JSON 映射（键为保供出口名称，值为该出口的取水路点；只需覆盖存在缺口的出口）
+        <textarea id="emergency-outlet-waypoints" class="sub-textarea" spellcheck="false"
+          placeholder='{"展厅B":"展厅B检修口","卫生间":"卫生间检修口"}'></textarea>
+      </label>
+      <div class="button-row">
+        <button id="plan-emergency" type="button" class="secondary">规划应急送水站布点</button>
+      </div>
     </section>
     <div class="side-column">
       <section class="panel result-panel">
@@ -297,6 +341,16 @@ app.innerHTML = `
           </p>
         </div>
       </section>
+      <section class="panel result-panel">
+        <h2>应急送水站布点</h2>
+        <div id="emergency-result">
+          <p class="hint">
+            填好候选送水站路点、每站可送水量、最大步行分钟与出口到取水路点的 JSON 映射后，
+            点击「规划应急送水站布点」，这里展示能补齐全部缺口的最少站点方案（站点、逐出口送水分配与总补齐量）；
+            各出口缺口均为 0 时提示无需布点，无法补齐时说明仍有缺口的出口。
+          </p>
+        </div>
+      </section>
     </div>
   </main>
 `;
@@ -316,6 +370,10 @@ const dryNodesEl = el<HTMLInputElement>('#dry-nodes');
 const observerCandidatesEl = el<HTMLInputElement>('#observer-candidates');
 const workPassageEl = el<HTMLTextAreaElement>('#work-passage');
 const routeStartEl = el<HTMLInputElement>('#route-start');
+const emergencyCandidatesEl = el<HTMLInputElement>('#emergency-candidates');
+const emergencyCapacityEl = el<HTMLInputElement>('#emergency-capacity');
+const emergencyMaxMinutesEl = el<HTMLInputElement>('#emergency-max-minutes');
+const emergencyOutletWaypointsEl = el<HTMLTextAreaElement>('#emergency-outlet-waypoints');
 const selectedSolutionHintEl = el<HTMLParagraphElement>('#selected-solution-hint');
 const resultEl = el<HTMLDivElement>('#result');
 const inspectResultEl = el<HTMLDivElement>('#inspect-result');
@@ -328,6 +386,7 @@ const valveRiskResultEl = el<HTMLDivElement>('#valve-risk-result');
 const reopenResultEl = el<HTMLDivElement>('#reopen-result');
 const anomalyResultEl = el<HTMLDivElement>('#anomaly-result');
 const observerResultEl = el<HTMLDivElement>('#observer-result');
+const emergencyResultEl = el<HTMLDivElement>('#emergency-result');
 
 /** 已生成填写表对应的供水点 / 保供出口。 */
 interface CapacityFormState {
@@ -1327,6 +1386,122 @@ function renderClosureRoute(result: ClosureRouteResult): void {
     </p>`;
 }
 
+function renderEmergencyStations(result: EmergencyStationResult): void {
+  if (result.status === 'invalid') {
+    renderErrors(emergencyResultEl, '输入有误，无法布点：', result.errors);
+    return;
+  }
+  if (result.status === 'empty') {
+    emergencyResultEl.innerHTML = `
+      <div class="banner success">无需布点：各出口缺口均为 0。</div>
+      <p>${escapeHtml(result.reason)}</p>
+      <p class="hint">布点测算以「供水能力核验」的各出口缺口为待送水量；缺口全为 0 时不改原始管网及阀门状态。</p>`;
+    return;
+  }
+  if (result.status === 'no-solution') {
+    const outletRows = result.outletRows
+      .map(
+        (o) => `
+        <tr>
+          <td>${escapeHtml(o.outlet)}</td>
+          <td>${escapeHtml(o.waypoint)}</td>
+          <td class="num">${o.shortfall}</td>
+          <td class="num">${o.delivered}</td>
+          <td class="num bad"><strong>${o.remaining}</strong></td>
+          <td>${o.remaining > 0 ? '<span class="tag tag-cut">未补齐</span>' : '<span class="tag tag-ok">已补齐</span>'}</td>
+        </tr>`
+      )
+      .join('');
+    emergencyResultEl.innerHTML = `
+      <div class="banner error">无解：无法补齐全部缺口。</div>
+      <p>${escapeHtml(result.reason)}</p>
+      <p class="hint">
+        候选送水站（${result.candidates.length} 个）：${result.candidates.map((c) => `<code>${escapeHtml(c)}</code>`).join('、')}；
+        每站可送水量 ${result.stationCapacity}；最大步行分钟 ${result.maxMinutes}；总待送水量 ${result.totalShortfall}，
+        全部站启用最多补齐 <strong>${result.bestDelivered}</strong>。
+      </p>
+      <table>
+        <thead>
+          <tr><th>保供出口</th><th>取水路点</th><th>缺口（待送水量）</th><th>可送到位</th><th>未补齐</th><th>状态</th></tr>
+        </thead>
+        <tbody>${outletRows}</tbody>
+      </table>
+      <p class="hint">未补齐出口：${result.unmetOutlets.map((o) => `<code>${escapeHtml(o)}</code>`).join('、')}。
+      可增设候选路点、提高每站可送水量或放宽最大步行分钟后重新规划；测算不修改管网拓扑与阀门登记状态。</p>`;
+    return;
+  }
+
+  const stationRows = result.stationRows
+    .map((s) => {
+      const allocText =
+        s.allocations.length > 0
+          ? s.allocations
+              .map((a) => `<code>${escapeHtml(a.outlet)}</code> × ${a.amount}（步行 ${a.minutes} 分钟）`)
+              .join('、')
+          : '<span class="hint">（本方案中不送水）</span>';
+      return `
+        <tr>
+          <td><code>${escapeHtml(s.station)}</code></td>
+          <td class="num">${s.capacity}</td>
+          <td class="num"><strong>${s.delivered}</strong></td>
+          <td>${s.serviceableOutlets.length > 0 ? s.serviceableOutlets.map((o) => `<code>${escapeHtml(o)}</code>`).join('、') : '<span class="hint">（步行限额内无可服务出口）</span>'}</td>
+          <td>${allocText}</td>
+        </tr>`;
+    })
+    .join('');
+
+  const outletRows = result.outletRows
+    .map(
+      (o) => `
+      <tr>
+        <td>${escapeHtml(o.outlet)}</td>
+        <td>${escapeHtml(o.waypoint)}</td>
+        <td class="num">${o.shortfall}</td>
+        <td class="num"><strong>${o.delivered}</strong></td>
+        <td class="num ${o.remaining > 0 ? 'bad' : 'ok'}">${o.remaining}</td>
+        <td>${o.remaining === 0 ? '<span class="tag tag-ok">已补齐</span>' : '<span class="tag tag-cut">未补齐</span>'}</td>
+      </tr>`
+    )
+    .join('');
+
+  emergencyResultEl.innerHTML = `
+    <div class="banner success">
+      全部缺口均可补齐：待送水量合计 <strong>${result.totalShortfall}</strong>，最少只需
+      <strong>${result.stationCount}</strong> 个应急送水站（候选 ${result.candidates.length} 个，
+      每站可送水量 ${result.stationCapacity}，最大步行 ${result.maxMinutes} 分钟）。
+      推荐站点（同数按站点名称升序列表字典序最小）：
+      ${result.stations.map((s) => `<code>${escapeHtml(s)}</code>`).join('、')}
+    </div>
+    <h3>送水站点与逐出口分配</h3>
+    <table>
+      <thead>
+        <tr><th>送水站路点</th><th>可送水量</th><th>实送合计</th><th>可服务出口（步行限额内）</th><th>逐出口送水量</th></tr>
+      </thead>
+      <tbody>${stationRows}</tbody>
+    </table>
+    <h3>逐出口补齐情况</h3>
+    <table>
+      <thead>
+        <tr><th>保供出口</th><th>取水路点</th><th>缺口（待送水量）</th><th>送到位</th><th>未补齐</th><th>状态</th></tr>
+      </thead>
+      <tbody>${outletRows}</tbody>
+      <tfoot>
+        <tr>
+          <td colspan="2" class="num"><strong>总补齐量</strong></td>
+          <td class="num"><strong>${result.totalShortfall}</strong></td>
+          <td class="num"><strong>${result.totalDelivered}</strong></td>
+          <td class="num ok"><strong>0</strong></td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+    <p class="hint">
+      可服务关系按作业通道最短步行距离建立（Floyd–Warshall），送水量由容量流整数分配：
+      站点出流不超过每站可送水量、每个出口入流不超过其缺口。缺口取自「供水能力核验」结果；
+      测算<strong>不改原始管网及阀门状态</strong>。
+    </p>`;
+}
+
 function readNetwork(): import('./solver').Network {
   let raw: unknown;
   try {
@@ -1556,6 +1731,90 @@ function runClosureRoute(): void {
   }
 }
 
+function runEmergencyStations(): void {
+  try {
+    const network = readNetwork();
+    if (!capacityFormState) {
+      renderErrors(emergencyResultEl, '请先填写核验数值：', [
+        '点击「按上方供水点 / 保供出口生成填写表」，为各点填写非负整数后再规划应急送水站布点。',
+      ]);
+      return;
+    }
+    const { supplyCaps, outletDemands, errors: formErrors } = readCapacityNumbers();
+    if (formErrors.length > 0) {
+      renderErrors(emergencyResultEl, '填写有误：', formErrors);
+      return;
+    }
+    let rawPassage: unknown;
+    try {
+      rawPassage = JSON.parse(workPassageEl.value);
+    } catch (e) {
+      renderErrors(emergencyResultEl, '作业通道 JSON 解析失败：', [(e as Error).message]);
+      return;
+    }
+    const { passage, errors: passageErrors } = parseWorkPassage(rawPassage);
+    if (!passage) {
+      renderErrors(emergencyResultEl, '作业通道 JSON 校验失败：', passageErrors);
+      return;
+    }
+    let rawOutletWaypoints: unknown;
+    try {
+      rawOutletWaypoints = JSON.parse(emergencyOutletWaypointsEl.value);
+    } catch (e) {
+      renderErrors(emergencyResultEl, '出口到路点映射 JSON 解析失败：', [(e as Error).message]);
+      return;
+    }
+    if (typeof rawOutletWaypoints !== 'object' || rawOutletWaypoints === null || Array.isArray(rawOutletWaypoints)) {
+      renderErrors(emergencyResultEl, '出口到路点映射有误：', ['映射必须是 JSON 对象，如 {"展厅B":"展厅B检修口"}。']);
+      return;
+    }
+    // 每站可送水量与最大步行分钟按非负 / 正整数校验（留空给出明确提示）
+    const numericErrors: string[] = [];
+    let stationCapacity = 0;
+    let maxMinutes = 0;
+    const capText = emergencyCapacityEl.value.trim();
+    if (capText === '') {
+      numericErrors.push('请填写每站可送水量（非负整数）。');
+    } else if (!/^\d+$/.test(capText) || !Number.isSafeInteger(Number(capText))) {
+      numericErrors.push('每站可送水量必须是非负整数。');
+    } else {
+      stationCapacity = Number(capText);
+    }
+    const minText = emergencyMaxMinutesEl.value.trim();
+    if (minText === '') {
+      numericErrors.push('请填写最大步行分钟（正整数）。');
+    } else if (!/^\d+$/.test(minText) || Number(minText) <= 0 || !Number.isSafeInteger(Number(minText))) {
+      numericErrors.push('最大步行分钟必须是正整数。');
+    } else {
+      maxMinutes = Number(minText);
+    }
+    if (numericErrors.length > 0) {
+      renderErrors(emergencyResultEl, '填写有误：', numericErrors);
+      return;
+    }
+    // 与供水能力核验共用同一份拓扑、供给上限与出口需求输入（填写表为权威名单；重点类别不参与）
+    const capacityQuery: CapacityQuery = {
+      supplies: capacityFormState.supplies,
+      outlets: capacityFormState.outlets,
+      supplyCaps,
+      outletDemands,
+    };
+    renderEmergencyStations(
+      planEmergencyStations({
+        network,
+        capacity: capacityQuery,
+        passage,
+        candidates: splitList(emergencyCandidatesEl.value),
+        stationCapacity,
+        maxMinutes,
+        outletWaypoints: rawOutletWaypoints as Record<string, string>,
+      })
+    );
+  } catch (e) {
+    renderErrors(emergencyResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+  }
+}
+
 el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   topologyEl.value = JSON.stringify(SAMPLE_NETWORK, null, 2);
   suppliesEl.value = SAMPLE_QUERY.supplies.join(', ');
@@ -1566,6 +1825,10 @@ el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   observerCandidatesEl.value = SAMPLE_OBSERVER_CANDIDATES.join(', ');
   workPassageEl.value = JSON.stringify(SAMPLE_WORK_PASSAGE, null, 2);
   routeStartEl.value = SAMPLE_ROUTE_START;
+  emergencyCandidatesEl.value = SAMPLE_EMERGENCY_CANDIDATES.join(', ');
+  emergencyCapacityEl.value = String(SAMPLE_EMERGENCY_STATION_CAPACITY);
+  emergencyMaxMinutesEl.value = String(SAMPLE_EMERGENCY_MAX_MINUTES);
+  emergencyOutletWaypointsEl.value = JSON.stringify(SAMPLE_EMERGENCY_OUTLET_WAYPOINTS, null, 2);
   buildCapacityForm(
     SAMPLE_QUERY.supplies,
     SAMPLE_QUERY.outlets,
@@ -1582,6 +1845,7 @@ el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   runAnomaly();
   runObserverPlan();
   runClosureRoute();
+  runEmergencyStations();
 });
 
 el<HTMLButtonElement>('#solve').addEventListener('click', run);
@@ -1594,6 +1858,7 @@ el<HTMLButtonElement>('#plan-reopen').addEventListener('click', runReopenPlan);
 el<HTMLButtonElement>('#locate-anomaly').addEventListener('click', runAnomaly);
 el<HTMLButtonElement>('#plan-observers').addEventListener('click', runObserverPlan);
 el<HTMLButtonElement>('#plan-closure-route').addEventListener('click', runClosureRoute);
+el<HTMLButtonElement>('#plan-emergency').addEventListener('click', runEmergencyStations);
 // 关阀方案结果区「选择该方案用于作业路线」按钮（事件委托）
 resultEl.addEventListener('click', (ev) => {
   const btn = (ev.target as HTMLElement).closest<HTMLButtonElement>('.select-solution-btn');
