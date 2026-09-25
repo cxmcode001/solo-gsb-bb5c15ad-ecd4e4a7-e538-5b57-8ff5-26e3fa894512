@@ -2514,3 +2514,426 @@ export function planClosureRoute(query: ClosureRouteQuery): ClosureRouteResult {
     totalMinutes: total,
   };
 }
+
+// ============ 应急送水站布点 ============
+
+/** 应急送水站：候选站路点最多枚举个数 */
+export const MAX_DELIVERY_STATIONS = 8;
+
+/** 一个候选应急送水站。 */
+export interface DeliveryStationInput {
+  /** 站名（即该站所在的作业通道路点名） */
+  name: string;
+  /** 该站最多可送出的水量（非负整数） */
+  capacity: number;
+}
+
+/** 应急送水站布点查询。 */
+export interface EmergencyDeliveryQuery extends CapacityQuery {
+  /** 候选送水站（去重后最多 MAX_DELIVERY_STATIONS 个，站名须为作业通道路点） */
+  stations: DeliveryStationInput[];
+  /** 送水员从站到出口允许的最大步行分钟（非负整数） */
+  maxWalkMinutes: number;
+  /** 保供出口节点名 -> 该出口取水口对应的作业通道路点 */
+  outletWaypoints: Record<string, string>;
+  /** 作业通道（与关阀作业路线共用的独立步行网络） */
+  passage: WorkPassage;
+}
+
+/** 一个出口在某送水方案下的受水情况。 */
+export interface DeliveryOutletRow {
+  /** 保供出口节点名 */
+  outlet: string;
+  /** 出口取水口路点 */
+  waypoint: string;
+  /** 待送水量（供水能力核验给出的缺口） */
+  need: number;
+  /** 本方案实际送到水量 */
+  delivered: number;
+  /** 仍未补齐的缺口 = need - delivered */
+  remaining: number;
+  /** 各站对该出口的整数送水分配（仅列送水量 > 0 的站，按站名字典序） */
+  byStation: DeliveryAssignment[];
+}
+
+/** 某站对某出口的一笔整数送水分配。 */
+export interface DeliveryAssignment {
+  station: string;
+  amount: number;
+  /** 该站到该出口取水口的最短步行分钟 */
+  walkMinutes: number;
+}
+
+/** 选中的送水站及其在方案中的送水明细。 */
+export interface DeliveryStationRow {
+  /** 站名（即路点名） */
+  name: string;
+  /** 该站可送水量上限 */
+  capacity: number;
+  /** 该站实际送出量 */
+  used: number;
+  /** 该站可服务（最短步行 ≤ 最大步行分钟、且有待送水量）的出口 */
+  servedOutlets: string[];
+}
+
+export interface EmergencyDeliveryOk {
+  status: 'ok';
+  /** 参与输水的管段总数（与供水能力核验一致） */
+  activePipeCount: number;
+  /** 候选站数（去重后） */
+  stationCount: number;
+  /** 允许的最大步行分钟 */
+  maxWalkMinutes: number;
+  /** 待送水量合计（= 供水能力核验的总缺口） */
+  totalNeed: number;
+  /** 方案实际补齐总量 */
+  totalDelivered: number;
+  /** 最少所需站数 */
+  stationUsed: number;
+  /** 选中的站（按名称升序） */
+  stations: DeliveryStationRow[];
+  /** 逐出口分配（按查询中保供出口顺序，仅列待送水量 > 0 的出口） */
+  rows: DeliveryOutletRow[];
+}
+
+/** 全部候选站也无法补齐全部缺口。 */
+export interface EmergencyDeliveryUnsolvable {
+  status: 'unsolvable';
+  activePipeCount: number;
+  stationCount: number;
+  maxWalkMinutes: number;
+  totalNeed: number;
+  /** 启用全部候选站时最多能送出的水量 */
+  totalDelivered: number;
+  /** 全部候选站启用下的逐出口受水情况 */
+  rows: DeliveryOutletRow[];
+  /** 仍未补齐的出口（名称升序） */
+  uncoveredOutlets: string[];
+  reason: string;
+}
+
+/** 待送水量合计为 0：无需布点。 */
+export interface EmergencyDeliveryEmpty {
+  status: 'empty';
+  reason: string;
+}
+
+export interface EmergencyDeliveryInvalid {
+  status: 'invalid';
+  errors: string[];
+}
+
+export type EmergencyDeliveryResult =
+  | EmergencyDeliveryOk
+  | EmergencyDeliveryUnsolvable
+  | EmergencyDeliveryEmpty
+  | EmergencyDeliveryInvalid;
+
+/** 路点名称列表的字典序比较（与页面 zh-Hans-CN 排序一致的确定性比较）。 */
+function compareNameLists(a: readonly string[], b: readonly string[]): number {
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    const c = a[i].localeCompare(b[i], 'zh-Hans-CN');
+    if (c !== 0) return c < 0 ? -1 : 1;
+  }
+  return a.length - b.length;
+}
+
+/** 在作业通道上求全部路点对最短步行分钟矩阵（不可达为 Infinity；并行通道取最小）。 */
+function passageDistances(passage: WorkPassage): number[][] {
+  const m = passage.waypoints.length;
+  const idxOf = new Map<string, number>();
+  passage.waypoints.forEach((wp, i) => idxOf.set(wp, i));
+  const dist: number[][] = Array.from({ length: m }, () => new Array(m).fill(Infinity));
+  for (let i = 0; i < m; i++) dist[i][i] = 0;
+  for (const e of passage.passages) {
+    const u = idxOf.get(e.from)!;
+    const v = idxOf.get(e.to)!;
+    if (u === v) continue; // 自环对正权最短路无意义
+    if (e.minutes < dist[u][v]) {
+      dist[u][v] = e.minutes;
+      dist[v][u] = e.minutes;
+    }
+  }
+  for (let k = 0; k < m; k++) {
+    for (let i = 0; i < m; i++) {
+      if (dist[i][k] === Infinity) continue;
+      for (let j = 0; j < m; j++) {
+        const via = dist[i][k] + dist[k][j];
+        if (via < dist[i][j]) dist[i][j] = via;
+      }
+    }
+  }
+  return dist;
+}
+
+/**
+ * 应急送水站布点：沿用当前拓扑、供水能力填写表与作业通道 JSON，先做供水能力核验，
+ * 以各保供出口的缺口作为待送水量；在用户给出的候选送水站（最多
+ * MAX_DELIVERY_STATIONS 个）中枚举站点子集，按作业通道最短步行距离建立
+ * 「站 → 出口取水口」可服务关系（最短步行 ≤ 最大步行分钟），用容量流（最大流）
+ * 求整数送水分配，选出能补齐全部缺口且站数最少的子集，同数按站点名称升序列表
+ * 字典序取舍；无解时给出全部候选站启用下仍未补齐的出口。
+ *
+ * 容量流网络：超级源点 → 各站（容量为该站可送水量），站 → 可服务出口取水口
+ * （容量为该出口待送水量），各出口取水口 → 超级汇点（容量为待送水量）；
+ * 流值达到待送水量合计即该子集可补齐全部缺口，汇点弧上的整数流量即逐出口分配。
+ * 纯函数测算：不修改拓扑 JSON、阀门登记状态、供水能力数值与作业通道输入。
+ */
+export function planEmergencyDeliveryStations(
+  network: Network,
+  query: EmergencyDeliveryQuery
+): EmergencyDeliveryResult {
+  // 1) 沿用供水能力核验：拓扑、阀门状态、供给上限与出口需求完全一致
+  const capacity = verifyCapacity(network, query);
+  if (capacity.status === 'invalid') {
+    return { status: 'invalid', errors: capacity.errors };
+  }
+  const activePipeCount = capacity.activePipeCount;
+
+  // 2) 缺口全为 0：无需布点（无需再校验候选站与步行参数；不改管网及阀门状态）
+  if (capacity.totalShortfall === 0) {
+    return {
+      status: 'empty',
+      reason:
+        '无需布点：供水能力核验显示全部保供出口均已足额（各出口缺口均为 0），' +
+        '当前不存在待送水量，管网与阀门状态保持不变。',
+    };
+  }
+
+  const errors: string[] = [];
+
+  // 候选站：去重（同名保留首个容量），按名称升序（字典序枚举顺序以此为准）
+  const stationMap = new Map<string, number>();
+  let stationEntryCount = 0;
+  if (!Array.isArray(query.stations)) {
+    errors.push('候选送水站必须是数组（每项含站路点名 name 与可送水量 capacity）。');
+  } else {
+    stationEntryCount = query.stations.length;
+    for (const s of query.stations) {
+      if (!s || typeof s.name !== 'string' || !s.name.trim()) {
+        errors.push('每个候选送水站必须包含非空字符串字段 name（站所在路点）。');
+        continue;
+      }
+      const name = s.name.trim();
+      if (typeof s.capacity !== 'number' || !Number.isSafeInteger(s.capacity) || s.capacity < 0) {
+        errors.push(`送水站「${name}」的可送水量必须是非负整数（收到：${String(s.capacity)}）。`);
+        continue;
+      }
+      if (stationMap.has(name)) {
+        errors.push(`候选送水站「${name}」重复，请为每个路点只填写一个站。`);
+        continue;
+      }
+      stationMap.set(name, s.capacity);
+    }
+  }
+  if (stationMap.size > MAX_DELIVERY_STATIONS) {
+    errors.push(
+      `候选送水站有 ${stationMap.size} 个，超过上限 ${MAX_DELIVERY_STATIONS} 个；请精简候选名单后再布点。`
+    );
+  }
+  if (Array.isArray(query.stations) && stationEntryCount > 0 && stationMap.size === 0) {
+    errors.push('没有有效的候选送水站：请修正各站的站路点名与可送水量后重试。');
+  }
+  if (Array.isArray(query.stations) && stationEntryCount === 0) {
+    errors.push('请至少填写一个候选送水站（站路点名与可送水量）。');
+  }
+
+  if (
+    typeof query.maxWalkMinutes !== 'number' ||
+    !Number.isSafeInteger(query.maxWalkMinutes) ||
+    query.maxWalkMinutes < 0
+  ) {
+    errors.push(`最大步行分钟必须是非负整数（收到：${String(query.maxWalkMinutes)}）。`);
+  }
+
+  if (!query.outletWaypoints || typeof query.outletWaypoints !== 'object' || Array.isArray(query.outletWaypoints)) {
+    errors.push('出口到路点的 JSON 映射必须是对象：键为保供出口名，值为该出口取水口所在路点。');
+  }
+
+  // 仅有待送水量 > 0 的出口参与布点
+  const needRows = capacity.rows.filter((r) => r.shortfall > 0);
+  const needOutletSet = new Set(needRows.map((r) => r.outlet));
+
+  const wpSet = new Set(query.passage.waypoints);
+  for (const name of stationMap.keys()) {
+    if (!wpSet.has(name)) {
+      errors.push(`送水站「${name}」所在路点未在作业通道 JSON 的 waypoints 中声明。`);
+    }
+  }
+  if (query.outletWaypoints && typeof query.outletWaypoints === 'object' && !Array.isArray(query.outletWaypoints)) {
+    for (const [outlet, wp] of Object.entries(query.outletWaypoints)) {
+      if (typeof wp !== 'string' || !wp.trim()) {
+        errors.push(`保供出口「${outlet}」映射的取水口路点必须是非空字符串。`);
+        continue;
+      }
+      if (!wpSet.has(wp.trim())) {
+        errors.push(`保供出口「${outlet}」的取水口路点「${wp.trim()}」未在作业通道 JSON 的 waypoints 中声明。`);
+      }
+      if (!needOutletSet.has(outlet) && !capacity.rows.some((r) => r.outlet === outlet)) {
+        errors.push(`出口到路点映射中的「${outlet}」不在保供出口名单中。`);
+      }
+      // 已足额（缺口为 0）的出口映射多余，忽略，不报错
+    }
+    for (const r of needRows) {
+      const wp = query.outletWaypoints[r.outlet];
+      if (wp === undefined) {
+        errors.push(`存在缺口的保供出口「${r.outlet}」缺少出口到路点映射，请在 JSON 中补充其取水口路点。`);
+      }
+    }
+  }
+  if (errors.length > 0) return { status: 'invalid', errors };
+
+  const stations = [...stationMap.entries()]
+    .map(([name, cap]) => ({ name, capacity: cap }))
+    .sort((a, b) => compareNameLists([a.name], [b.name]));
+  const maxWalk = query.maxWalkMinutes as number;
+  const outletWaypointOf = new Map<string, string>(
+    needRows.map((r) => [r.outlet, (query.outletWaypoints as Record<string, string>)[r.outlet].trim()])
+  );
+
+  // 3) 作业通道最短步行距离与「站 → 出口」可服务关系
+  const dist = passageDistances(query.passage);
+  const idxOf = new Map<string, number>();
+  query.passage.waypoints.forEach((wp, i) => idxOf.set(wp, i));
+  const needs = needRows.map((r) => ({ outlet: r.outlet, need: r.shortfall }));
+  /** serviceable[s][o]：站 s 到出口 o 取水口的最短步行分钟；不可达或超限时为 null。 */
+  const serviceable: (number | null)[][] = stations.map((s) =>
+    needs.map((n) => {
+      const d = dist[idxOf.get(s.name)!][idxOf.get(outletWaypointOf.get(n.outlet)!)!];
+      return d !== Infinity && d <= maxWalk ? d : null;
+    })
+  );
+
+  /**
+   * 对给定站子集构建容量流求最大送水量与逐弧整数流量。
+   * 返回 null 表示站子集为空且仍有待送水量；否则返回流值与站→出口分配矩阵。
+   */
+  const flowWith = (
+    chosen: readonly number[]
+  ): { flow: number; alloc: number[][]; stationUsedFlow: number[] } => {
+    const ns = chosen.length;
+    const no = needs.length;
+    // 节点：0..ns-1 站，ns..ns+no-1 出口；源 ns+no，汇 ns+no+1
+    const dinic = new CapacityDinic(ns + no);
+    const S = dinic.source;
+    const T = dinic.sink;
+    const alloc: number[][] = Array.from({ length: ns }, () => new Array(no).fill(0));
+    const stationArc: number[] = [];
+    chosen.forEach((si, k) => {
+      stationArc.push(dinic.addArc(S, k, stations[si].capacity));
+    });
+    for (let o = 0; o < no; o++) {
+      dinic.addArc(ns + o, T, needs[o].need);
+    }
+    const arcRefs: { k: number; o: number; arc: number }[] = [];
+    chosen.forEach((si, k) => {
+      for (let o = 0; o < no; o++) {
+        if (serviceable[si][o] !== null) {
+          const arc = dinic.addArc(k, ns + o, needs[o].need);
+          arcRefs.push({ k, o, arc });
+        }
+      }
+    });
+    const flow = dinic.maxFlow(S, T);
+    for (const { k, o, arc } of arcRefs) {
+      // 该弧初始容量为出口待送水量，已流量 = 初始 - 残量
+      alloc[k][o] = needs[o].need - dinic.residualCap(arc);
+    }
+    const stationUsedFlow = chosen.map((si, k) =>
+      stations[si].capacity - dinic.residualCap(stationArc[k])
+    );
+    return { flow, alloc, stationUsedFlow };
+  };
+
+  const totalNeed = needs.reduce((sum, n) => sum + n.need, 0);
+
+  /** 把某次容量流结果整理为页面展示结构。 */
+  const buildRows = (
+    chosen: readonly number[],
+    alloc: number[][]
+  ): { rows: DeliveryOutletRow[]; totalDelivered: number } => {
+    const rows: DeliveryOutletRow[] = needs.map((n, o) => {
+      const byStation: DeliveryAssignment[] = [];
+      chosen.forEach((si, k) => {
+        if (alloc[k][o] > 0) {
+          byStation.push({
+            station: stations[si].name,
+            amount: alloc[k][o],
+            walkMinutes: serviceable[si][o]!,
+          });
+        }
+      });
+      byStation.sort((a, b) => compareNameLists([a.station], [b.station]));
+      const delivered = byStation.reduce((sum, x) => sum + x.amount, 0);
+      return {
+        outlet: n.outlet,
+        waypoint: outletWaypointOf.get(n.outlet)!,
+        need: n.need,
+        delivered,
+        remaining: n.need - delivered,
+        byStation,
+      };
+    });
+    return { rows, totalDelivered: rows.reduce((sum, r) => sum + r.delivered, 0) };
+  };
+
+  // 4) 按站数 k = 0, 1, … 枚举子集；同 k 下按站名称升序列表字典序生成，首个可行即推荐
+  const n = stations.length;
+  for (let k = 0; k <= n; k++) {
+    const idx = Array.from({ length: k }, (_, i) => i);
+    while (true) {
+      const chosen = idx.slice();
+      const { flow, alloc, stationUsedFlow } = flowWith(chosen);
+      if (flow >= totalNeed) {
+        const { rows, totalDelivered } = buildRows(chosen, alloc);
+        const stationRows: DeliveryStationRow[] = chosen.map((si, kk) => ({
+          name: stations[si].name,
+          capacity: stations[si].capacity,
+          used: stationUsedFlow[kk],
+          servedOutlets: needs
+            .filter((_, o) => alloc[kk][o] > 0)
+            .map((nn) => nn.outlet),
+        }));
+        return {
+          status: 'ok',
+          activePipeCount,
+          stationCount: n,
+          maxWalkMinutes: maxWalk,
+          totalNeed,
+          totalDelivered,
+          stationUsed: k,
+          stations: stationRows,
+          rows,
+        };
+      }
+      if (k === 0) break;
+      let i = k - 1;
+      while (i >= 0 && idx[i] === n - k + i) i--;
+      if (i < 0) break;
+      idx[i]++;
+      for (let j = i + 1; j < k; j++) idx[j] = idx[j - 1] + 1;
+    }
+  }
+
+  // 5) 无解：全部候选站启用也无法补齐，逐出口列出仍未补齐者
+  const allIdx = stations.map((_, i) => i);
+  const { alloc } = flowWith(allIdx);
+  const { rows, totalDelivered } = buildRows(allIdx, alloc);
+  const uncoveredOutlets = rows.filter((r) => r.remaining > 0).map((r) => r.outlet);
+  uncoveredOutlets.sort((a, b) => compareNameLists([a], [b]));
+  return {
+    status: 'unsolvable',
+    activePipeCount,
+    stationCount: n,
+    maxWalkMinutes: maxWalk,
+    totalNeed,
+    totalDelivered,
+    rows,
+    uncoveredOutlets,
+    reason:
+      `即使启用全部 ${n} 个候选送水站，受站可送水量与最大步行 ${maxWalk} 分钟内的可服务关系限制，` +
+      `仍有 ${uncoveredOutlets.length} 个出口的缺口无法补齐：` +
+      `${uncoveredOutlets.map((o) => `「${o}」`).join('、')}。` +
+      '请增设更靠近这些出口取水口的候选站、提高站可送水量或放宽最大步行分钟后重试。',
+  };
+}

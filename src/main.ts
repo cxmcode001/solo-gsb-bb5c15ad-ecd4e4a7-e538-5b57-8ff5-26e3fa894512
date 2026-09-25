@@ -12,6 +12,7 @@ import {
   planReopenSequence,
   parseWorkPassage,
   planClosureRoute,
+  planEmergencyDeliveryStations,
   MAX_OPEN_VALVES,
   EXPANSION_TARGET_CAPACITY,
   MAX_EXPANSION_PIPES,
@@ -20,6 +21,7 @@ import {
   MAX_OBSERVER_CANDIDATES,
   MAX_REOPEN_VALVES,
   MAX_ROUTE_VALVES,
+  MAX_DELIVERY_STATIONS,
   type Query,
   type CapacityQuery,
   type AnomalyQuery,
@@ -37,6 +39,7 @@ import {
   type ObserverPlanResult,
   type ObserverHypothesis,
   type ReopenResult,
+  type EmergencyDeliveryResult,
 } from './solver';
 import {
   SAMPLE_NETWORK,
@@ -49,6 +52,10 @@ import {
   SAMPLE_OBSERVER_CANDIDATES,
   SAMPLE_WORK_PASSAGE,
   SAMPLE_ROUTE_START,
+  SAMPLE_DELIVERY_STATIONS,
+  SAMPLE_DELIVERY_CAPS,
+  SAMPLE_DELIVERY_MAX_WALK,
+  SAMPLE_OUTLET_WAYPOINTS,
 } from './sample';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
@@ -71,7 +78,10 @@ app.innerHTML = `
       每步仅开启一个待开阀门，规划使各步开阀后总获配量之和最大的完整开阀顺序），
       并能在选定关阀方案后做「关阀作业路线」（另填路点 / 无向通道 / 步行分钟 / 阀门路点的作业通道 JSON 与出发路点，
       先求路点间最短通行距离，再用子集动态规划求出发并返回、总步行时间最少的完整关阀路线，
-      同分按阀门编号序列字典序取舍，必访阀门最多 ${MAX_ROUTE_VALVES} 个）。
+      同分按阀门编号序列字典序取舍，必访阀门最多 ${MAX_ROUTE_VALVES} 个），
+      还能做「应急送水站布点」（沿用当前拓扑、供水能力填写表与作业通道 JSON，以核验给出的各出口缺口为待送水量，
+      枚举最多 ${MAX_DELIVERY_STATIONS} 个候选站的子集，按最短步行距离建立可服务关系、用容量流分配整数送水量，
+      选能补齐全部缺口且站数最少的方案，同数按站点名称升序列表字典序；无解时列出未补齐出口，缺口全为 0 时提示无需布点）。
       组合搜索最多覆盖 ${MAX_OPEN_VALVES} 个当前开启的阀门；求解过程不修改输入中的阀门状态。
     </p>
   </header>
@@ -204,6 +214,37 @@ app.innerHTML = `
         <button id="plan-closure-route" type="button" class="secondary">规划关阀作业路线</button>
       </div>
       <p class="hint" id="selected-solution-hint">尚未选择方案：请先点击「搜索关阀方案」，再在结果中选择一个方案（默认选择推荐方案）。</p>
+      <h2>7. 应急送水站布点</h2>
+      <p class="hint">
+        沿用当前拓扑、上方供水能力填写表与作业通道 JSON：先以<strong>供水能力核验</strong>给出的各出口<strong>缺口</strong>作为待送水量，
+        填写<strong>候选站路点</strong>（最多 ${MAX_DELIVERY_STATIONS} 个）、<strong>每站可送水量</strong>、<strong>最大步行分钟</strong>
+        与<strong>出口到取水口路点的 JSON 映射</strong>。按作业通道<strong>最短步行距离</strong>建立「站 → 出口」可服务关系，
+        枚举站点子集并用<strong>容量流</strong>分配整数送水量，选出能补齐全部缺口且<strong>站数最少</strong>的方案
+        （同数按站点名称升序列表字典序），无解时列出仍未补齐的出口；缺口全为 0 时提示无需布点。
+        测算<strong>不改原始管网及阀门状态</strong>。
+      </p>
+      <div class="fields">
+        <label>
+          候选站路点（多个用逗号分隔，最多 ${MAX_DELIVERY_STATIONS} 个，均须在作业通道 waypoints 中）
+          <input id="delivery-stations" type="text" placeholder="如：环管N1井位, 环管N3井位" />
+        </label>
+        <label>
+          最大步行分钟（非负整数，站到出口取水口的最短步行不超过该值才可服务）
+          <input id="delivery-max-walk" type="number" min="0" step="1" inputmode="numeric" placeholder="如：6" />
+        </label>
+      </div>
+      <button id="build-delivery-form" type="button">按候选站路点生成可送水量填写表</button>
+      <div id="delivery-form" class="capacity-form">
+        <p class="hint">尚未生成填写表：填写候选站路点后点击上方按钮，再为各站填写非负整数可送水量。</p>
+      </div>
+      <label>
+        出口到取水口路点的 JSON 映射（仅需覆盖有缺口的出口，路点须在作业通道 waypoints 中）
+        <textarea id="outlet-waypoints" class="sub-textarea" spellcheck="false"
+          placeholder='{"展厅B":"展厅B检修口","咖啡厅":"咖啡厅取水口"}'></textarea>
+      </label>
+      <div class="button-row">
+        <button id="plan-delivery" type="button" class="secondary">规划应急送水站布点</button>
+      </div>
     </section>
     <div class="side-column">
       <section class="panel result-panel">
@@ -297,6 +338,17 @@ app.innerHTML = `
           </p>
         </div>
       </section>
+      <section class="panel result-panel">
+        <h2>应急送水站布点</h2>
+        <div id="delivery-result">
+          <p class="hint">
+            填好候选站路点、各站可送水量、最大步行分钟与出口到路点映射后点击「规划应急送水站布点」，
+            这里以供水能力核验的各出口缺口为待送水量，给出能补齐全部缺口且站数最少的布点方案
+            （站点、逐出口整数送水分配与总补齐量）；全部候选站也无法补齐时列出未补齐出口，
+            缺口全为 0 时提示无需布点。布点测算不修改管网与阀门状态。
+          </p>
+        </div>
+      </section>
     </div>
   </main>
 `;
@@ -316,6 +368,9 @@ const dryNodesEl = el<HTMLInputElement>('#dry-nodes');
 const observerCandidatesEl = el<HTMLInputElement>('#observer-candidates');
 const workPassageEl = el<HTMLTextAreaElement>('#work-passage');
 const routeStartEl = el<HTMLInputElement>('#route-start');
+const deliveryStationsEl = el<HTMLInputElement>('#delivery-stations');
+const deliveryMaxWalkEl = el<HTMLInputElement>('#delivery-max-walk');
+const outletWaypointsEl = el<HTMLTextAreaElement>('#outlet-waypoints');
 const selectedSolutionHintEl = el<HTMLParagraphElement>('#selected-solution-hint');
 const resultEl = el<HTMLDivElement>('#result');
 const inspectResultEl = el<HTMLDivElement>('#inspect-result');
@@ -328,6 +383,8 @@ const valveRiskResultEl = el<HTMLDivElement>('#valve-risk-result');
 const reopenResultEl = el<HTMLDivElement>('#reopen-result');
 const anomalyResultEl = el<HTMLDivElement>('#anomaly-result');
 const observerResultEl = el<HTMLDivElement>('#observer-result');
+const deliveryFormEl = el<HTMLDivElement>('#delivery-form');
+const deliveryResultEl = el<HTMLDivElement>('#delivery-result');
 
 /** 已生成填写表对应的供水点 / 保供出口。 */
 interface CapacityFormState {
@@ -335,6 +392,9 @@ interface CapacityFormState {
   outlets: string[];
 }
 let capacityFormState: CapacityFormState | null = null;
+
+/** 已生成可送水量填写表对应的候选送水站路点。 */
+let deliveryFormState: string[] | null = null;
 
 /** 当前在关阀方案结果中选中的方案（待关闭阀门编号）；null 表示尚未选择有效方案。 */
 let selectedClosedValves: string[] | null = null;
@@ -646,6 +706,62 @@ function readCapacityNumbers(): {
     if (select.value === 'priority') priorityOutlets.push(select.dataset.priority!);
   });
   return { supplyCaps, outletDemands, priorityOutlets, errors };
+}
+
+/** 渲染候选送水站的可送水量填写表（重新生成时保留同名站已填数值）。 */
+function buildDeliveryForm(stations: string[], prevCaps?: Record<string, number>): void {
+  const rows = stations
+    .map(
+      (s) => `
+        <label class="cap-row">
+          <span>${escapeHtml(s)}</span>
+          <input
+            type="number"
+            min="0"
+            step="1"
+            inputmode="numeric"
+            data-station="${escapeHtml(s)}"
+            value="${prevCaps && prevCaps[s] !== undefined ? String(prevCaps[s]) : ''}"
+            placeholder="可送水量"
+          />
+        </label>`
+    )
+    .join('');
+  deliveryFormEl.innerHTML = `
+    <div class="cap-grid">
+      <div>
+        <h3>各候选站可送水量</h3>
+        ${stations.length > 0 ? rows : '<p class="hint">请先在上方填写至少一个候选站路点。</p>'}
+        ${stations.length > 0 ? '<p class="hint">留空按 0 处理；每站按其可送水量上限参与容量流分配。</p>' : ''}
+      </div>
+    </div>`;
+  deliveryFormState = stations;
+}
+
+/** 读取候选站可送水量填写表（留空按 0）；返回错误信息列表。 */
+function readDeliveryNumbers(): { caps: Record<string, number>; errors: string[] } {
+  const caps: Record<string, number> = {};
+  const errors: string[] = [];
+  if (!deliveryFormState) return { caps, errors: ['请先生成候选站可送水量填写表。'] };
+  deliveryFormEl.querySelectorAll<HTMLInputElement>('input[data-station]').forEach((input) => {
+    const name = input.dataset.station!;
+    const text = input.value.trim();
+    if (text === '') {
+      caps[name] = 0;
+      return;
+    }
+    if (!/^\d+$/.test(text)) {
+      errors.push(`送水站「${name}」的可送水量必须是非负整数。`);
+      return;
+    }
+    const n = Number(text);
+    if (!Number.isSafeInteger(n)) {
+      errors.push(`送水站「${name}」的可送水量数值过大。`);
+      return;
+    }
+    caps[name] = n;
+  });
+  return { caps, errors };
 }
 
 const CUT_KIND_LABEL: Record<import('./solver').CapacityCutKind, string> = {
@@ -1327,6 +1443,111 @@ function renderClosureRoute(result: ClosureRouteResult): void {
     </p>`;
 }
 
+function renderEmergencyDelivery(result: EmergencyDeliveryResult): void {
+  if (result.status === 'invalid') {
+    renderErrors(deliveryResultEl, '输入有误，无法布点：', result.errors);
+    return;
+  }
+  if (result.status === 'empty') {
+    deliveryResultEl.innerHTML = `
+      <div class="banner success">无需布点：全部出口缺口均为 0。</div>
+      <p>${escapeHtml(result.reason)}</p>`;
+    return;
+  }
+
+  // 逐出口分配明细（有缺口出口；byStation 列出每笔整数送水）
+  const outletRows = result.rows
+    .map((r) => {
+      const detail =
+        r.byStation.length > 0
+          ? r.byStation
+              .map(
+                (a) =>
+                  `<code>${escapeHtml(a.station)}</code> 送 <strong>${a.amount}</strong>` +
+                  `<span class="hint">（步行 ${a.walkMinutes} 分钟）</span>`
+              )
+              .join('；')
+          : '<span class="hint">（无站可送达）</span>';
+      const stateTag =
+        r.remaining === 0
+          ? '<span class="tag tag-ok">已补齐</span>'
+          : '<span class="tag tag-cut">未补齐</span>';
+      return `
+      <tr>
+        <td>${escapeHtml(r.outlet)}<span class="hint">（取水口 ${escapeHtml(r.waypoint)}）</span></td>
+        <td class="num">${r.need}</td>
+        <td>${detail}</td>
+        <td class="num"><strong>${r.delivered}</strong></td>
+        <td class="num ${r.remaining > 0 ? 'bad' : 'ok'}">${r.remaining}</td>
+        <td>${stateTag}</td>
+      </tr>`;
+    })
+    .join('');
+
+  if (result.status === 'unsolvable') {
+    deliveryResultEl.innerHTML = `
+      <div class="banner error">无解：全部候选站启用仍无法补齐全部缺口。</div>
+      <p>${escapeHtml(result.reason)}</p>
+      <p class="hint">
+        待送水量合计 <strong>${result.totalNeed}</strong>；全部 ${result.stationCount} 个候选站启用时最多送出
+        <strong>${result.totalDelivered}</strong>，仍缺 <strong>${result.totalNeed - result.totalDelivered}</strong>。
+      </p>
+      <table>
+        <thead>
+          <tr><th>保供出口（取水口）</th><th>待送水量</th><th>各站送水分配</th><th>实送</th><th>未补齐</th><th>状态</th></tr>
+        </thead>
+        <tbody>${outletRows}</tbody>
+      </table>
+      <p class="hint">
+        未补齐出口：${result.uncoveredOutlets.map((o) => `<code>${escapeHtml(o)}</code>`).join('、')}。
+        可服务关系按作业通道最短步行距离（≤ ${result.maxWalkMinutes} 分钟）建立；
+        布点测算不修改原始管网及阀门状态。
+      </p>`;
+    return;
+  }
+
+  const stationRows = result.stations
+    .map(
+      (s) => `
+      <tr>
+        <td><code>${escapeHtml(s.name)}</code></td>
+        <td class="num">${s.capacity}</td>
+        <td class="num"><strong>${s.used}</strong></td>
+        <td class="num">${s.capacity - s.used}</td>
+        <td>${s.servedOutlets.length > 0 ? s.servedOutlets.map((o) => escapeHtml(o)).join('、') : '<span class="hint">—</span>'}</td>
+      </tr>`
+    )
+    .join('');
+
+  deliveryResultEl.innerHTML = `
+    <div class="banner success">
+      推荐布设 <strong>${result.stationUsed}</strong> 个应急送水站（候选 ${result.stationCount} 个中的最少站数，
+      同数按站点名称升序列表字典序取最小）：
+      ${result.stations.map((s) => `<code>${escapeHtml(s.name)}</code>`).join('、')}；
+      总补齐量 <strong>${result.totalDelivered}</strong> / 待送水量 ${result.totalNeed}，全部缺口均已补齐。
+    </div>
+    <h3>逐出口整数送水分配</h3>
+    <table>
+      <thead>
+        <tr><th>保供出口（取水口）</th><th>待送水量</th><th>各站送水分配</th><th>实送</th><th>未补齐</th><th>状态</th></tr>
+      </thead>
+      <tbody>${outletRows}</tbody>
+    </table>
+    <h3>各送水站用水情况（上限 / 已送 / 富余）</h3>
+    <table>
+      <thead>
+        <tr><th>送水站（路点）</th><th>可送水量</th><th>已送出</th><th>富余</th><th>服务出口</th></tr>
+      </thead>
+      <tbody>${stationRows}</tbody>
+    </table>
+    <p class="hint">
+      待送水量取自<strong>供水能力核验</strong>的各出口缺口（参与输水管段 ${result.activePipeCount} 条，与核验一致）；
+      站到出口取水口按作业通道<strong>最短步行距离</strong>判定可服务（不超过 ${result.maxWalkMinutes} 分钟），
+      送水量经<strong>容量流</strong>做整数分配。本结果仅为应急送水方案测算，
+      <strong>不修改原始管网、阀门登记状态、供水能力数值与作业通道输入</strong>。
+    </p>`;
+}
+
 function readNetwork(): import('./solver').Network {
   let raw: unknown;
   try {
@@ -1556,6 +1777,79 @@ function runClosureRoute(): void {
   }
 }
 
+function runDeliveryPlan(): void {
+  try {
+    const network = readNetwork();
+    if (!capacityFormState) {
+      renderErrors(deliveryResultEl, '请先填写核验数值：', [
+        '点击「按上方供水点 / 保供出口生成填写表」，为各点填写非负整数后先做供水能力核验，再规划送水站布点。',
+      ]);
+      return;
+    }
+    if (!deliveryFormState) {
+      renderErrors(deliveryResultEl, '请先生成候选站填写表：', [
+        '填写候选站路点后点击「按候选站路点生成可送水量填写表」，再为各站填写可送水量。',
+      ]);
+      return;
+    }
+    const { supplyCaps, outletDemands, errors: capErrors } = readCapacityNumbers();
+    if (capErrors.length > 0) {
+      renderErrors(deliveryResultEl, '供水能力填写表有误：', capErrors);
+      return;
+    }
+    const { caps: stationCaps, errors: stationErrors } = readDeliveryNumbers();
+    if (stationErrors.length > 0) {
+      renderErrors(deliveryResultEl, '候选站填写有误：', stationErrors);
+      return;
+    }
+    const maxWalkText = deliveryMaxWalkEl.value.trim();
+    if (maxWalkText === '' || !/^\d+$/.test(maxWalkText)) {
+      renderErrors(deliveryResultEl, '填写有误：', ['最大步行分钟必须是非负整数。']);
+      return;
+    }
+    const maxWalkMinutes = Number(maxWalkText);
+    if (!Number.isSafeInteger(maxWalkMinutes)) {
+      renderErrors(deliveryResultEl, '填写有误：', ['最大步行分钟数值过大。']);
+      return;
+    }
+    let rawPassage: unknown;
+    try {
+      rawPassage = JSON.parse(workPassageEl.value);
+    } catch (e) {
+      renderErrors(deliveryResultEl, '作业通道 JSON 解析失败：', [(e as Error).message]);
+      return;
+    }
+    const { passage, errors: passageErrors } = parseWorkPassage(rawPassage);
+    if (!passage) {
+      renderErrors(deliveryResultEl, '作业通道 JSON 校验失败：', passageErrors);
+      return;
+    }
+    let outletWaypoints: unknown;
+    try {
+      outletWaypoints = JSON.parse(outletWaypointsEl.value);
+    } catch (e) {
+      renderErrors(deliveryResultEl, '出口到路点 JSON 解析失败：', [(e as Error).message]);
+      return;
+    }
+    const stations = deliveryFormState.map((name) => ({ name, capacity: stationCaps[name] ?? 0 }));
+    renderEmergencyDelivery(
+      planEmergencyDeliveryStations(network, {
+        // 与供水能力核验共用同一份拓扑、供给上限与出口需求输入（填写表为权威名单）
+        supplies: capacityFormState.supplies,
+        outlets: capacityFormState.outlets,
+        supplyCaps,
+        outletDemands,
+        stations,
+        maxWalkMinutes,
+        outletWaypoints: outletWaypoints as Record<string, string>,
+        passage,
+      })
+    );
+  } catch (e) {
+    renderErrors(deliveryResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+  }
+}
+
 el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   topologyEl.value = JSON.stringify(SAMPLE_NETWORK, null, 2);
   suppliesEl.value = SAMPLE_QUERY.supplies.join(', ');
@@ -1566,6 +1860,9 @@ el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   observerCandidatesEl.value = SAMPLE_OBSERVER_CANDIDATES.join(', ');
   workPassageEl.value = JSON.stringify(SAMPLE_WORK_PASSAGE, null, 2);
   routeStartEl.value = SAMPLE_ROUTE_START;
+  deliveryStationsEl.value = SAMPLE_DELIVERY_STATIONS.join(', ');
+  deliveryMaxWalkEl.value = String(SAMPLE_DELIVERY_MAX_WALK);
+  outletWaypointsEl.value = JSON.stringify(SAMPLE_OUTLET_WAYPOINTS, null, 2);
   buildCapacityForm(
     SAMPLE_QUERY.supplies,
     SAMPLE_QUERY.outlets,
@@ -1573,6 +1870,7 @@ el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
     SAMPLE_OUTLET_DEMANDS,
     new Set(SAMPLE_PRIORITY_OUTLETS)
   );
+  buildDeliveryForm(SAMPLE_DELIVERY_STATIONS, SAMPLE_DELIVERY_CAPS);
   run();
   runInspection();
   runCapacity();
@@ -1582,6 +1880,7 @@ el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   runAnomaly();
   runObserverPlan();
   runClosureRoute();
+  runDeliveryPlan();
 });
 
 el<HTMLButtonElement>('#solve').addEventListener('click', run);
@@ -1594,6 +1893,19 @@ el<HTMLButtonElement>('#plan-reopen').addEventListener('click', runReopenPlan);
 el<HTMLButtonElement>('#locate-anomaly').addEventListener('click', runAnomaly);
 el<HTMLButtonElement>('#plan-observers').addEventListener('click', runObserverPlan);
 el<HTMLButtonElement>('#plan-closure-route').addEventListener('click', runClosureRoute);
+el<HTMLButtonElement>('#plan-delivery').addEventListener('click', runDeliveryPlan);
+el<HTMLButtonElement>('#build-delivery-form').addEventListener('click', () => {
+  const stations = [...new Set(splitList(deliveryStationsEl.value))];
+  if (stations.length > MAX_DELIVERY_STATIONS) {
+    renderErrors(deliveryResultEl, '候选站过多：', [
+      `候选送水站有 ${stations.length} 个，超过上限 ${MAX_DELIVERY_STATIONS} 个；请精简候选名单后再生成填写表。`,
+    ]);
+    return;
+  }
+  // 重新生成时保留同名站已填数值
+  const prev = readDeliveryNumbers();
+  buildDeliveryForm(stations, prev.caps);
+});
 // 关阀方案结果区「选择该方案用于作业路线」按钮（事件委托）
 resultEl.addEventListener('click', (ev) => {
   const btn = (ev.target as HTMLElement).closest<HTMLButtonElement>('.select-solution-btn');

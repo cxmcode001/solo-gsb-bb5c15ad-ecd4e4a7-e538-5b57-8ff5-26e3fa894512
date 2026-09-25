@@ -1314,5 +1314,208 @@ check('路线测算不修改拓扑', JSON.stringify(routeNet) === beforeRouteNet
 check('路线测算不修改作业通道输入', JSON.stringify(passage) === beforeRoutePsg);
 check('路线测算不修改待关闭阀门入参数组', closedInput.join(',') === 'V2,V1');
 
+// ============ 应急送水站布点 ============
+console.log('应急送水站布点：');
+
+// S 经单条单位容量阀门 V1 接 O：供给 5、需求 3 → 获配 1、缺口 2
+const delNet = {
+  nodes: ['S', 'O'],
+  pipes: [],
+  valvedPipes: [{ id: 'V1', from: 'S', to: 'O', open: true }],
+};
+const delPassage = {
+  waypoints: ['gate', 'p1', 'p2', 'oport'],
+  passages: [
+    { id: 'W1', from: 'gate', to: 'p1', minutes: 3 },
+    { id: 'W2', from: 'p1', to: 'oport', minutes: 3 },
+    { id: 'W3', from: 'gate', to: 'p2', minutes: 10 },
+    { id: 'W4', from: 'p2', to: 'oport', minutes: 2 },
+  ],
+  valveWaypoints: {},
+};
+const delBase = {
+  supplies: ['S'],
+  outlets: ['O'],
+  supplyCaps: { S: 5 },
+  outletDemands: { O: 3 },
+  passage: delPassage,
+  maxWalkMinutes: 6,
+  outletWaypoints: { O: 'oport' },
+};
+
+const d1 = solver.planEmergencyDeliveryStations(delNet, { ...delBase, stations: [{ name: 'gate', capacity: 5 }] });
+check('单站可补齐：ok、用 1 站、补齐 2', d1.status === 'ok' && d1.stationUsed === 1 &&
+  d1.totalNeed === 2 && d1.totalDelivered === 2 &&
+  d1.stations.length === 1 && d1.stations[0].name === 'gate' && d1.stations[0].used === 2);
+check('逐出口分配为整数且含步行分钟', d1.rows.length === 1 &&
+  d1.rows[0].remaining === 0 && d1.rows[0].byStation.length === 1 &&
+  d1.rows[0].byStation[0].station === 'gate' && d1.rows[0].byStation[0].amount === 2 &&
+  d1.rows[0].byStation[0].walkMinutes === 6);
+
+const d2 = solver.planEmergencyDeliveryStations(delNet, { ...delBase, stations: [{ name: 'gate', capacity: 1 }] });
+check('站容量不足：unsolvable 且列出未补齐出口', d2.status === 'unsolvable' &&
+  d2.totalDelivered === 1 && d2.uncoveredOutlets.join(',') === 'O' &&
+  d2.rows[0].remaining === 1);
+
+const d3 = solver.planEmergencyDeliveryStations(delNet, {
+  ...delBase,
+  stations: [{ name: 'gate', capacity: 5 }],
+  maxWalkMinutes: 5, // gate→oport 最短 6 分钟，超出
+});
+check('步行超限不可服务：unsolvable、送出 0', d3.status === 'unsolvable' &&
+  d3.totalDelivered === 0 && d3.uncoveredOutlets.includes('O'));
+
+// 两出口：A 只近 x，B 只近 y，z 经两跳可达两处（步行 2）→ 步行限制 1 时必须 2 站
+const delNet2 = {
+  nodes: ['S', 'A', 'B'],
+  pipes: [],
+  valvedPipes: [],
+};
+const delPassage2 = {
+  waypoints: ['wA', 'wB', 'x', 'y', 'z'],
+  passages: [
+    { from: 'x', to: 'wA', minutes: 1 },
+    { from: 'y', to: 'wB', minutes: 1 },
+    { from: 'z', to: 'x', minutes: 1 },
+    { from: 'z', to: 'y', minutes: 1 },
+  ],
+  valveWaypoints: {},
+};
+const d4 = solver.planEmergencyDeliveryStations(delNet2, {
+  supplies: ['S'],
+  outlets: ['A', 'B'],
+  supplyCaps: { S: 0 },
+  outletDemands: { A: 2, B: 3 },
+  passage: delPassage2,
+  maxWalkMinutes: 1,
+  outletWaypoints: { A: 'wA', B: 'wB' },
+  stations: [
+    { name: 'z', capacity: 10 },
+    { name: 'y', capacity: 5 },
+    { name: 'x', capacity: 5 },
+  ],
+});
+check('两出口必须两站：站数最少为 2', d4.status === 'ok' && d4.stationUsed === 2);
+check('同数按站点名称升序列表字典序：[x, y] 优先于 [x, z]/[y, z]',
+  d4.stations.map((s) => s.name).join(',') === 'x,y');
+check('各出口整数补齐（A=2 由 x，B=3 由 y）',
+  d4.rows.find((r) => r.outlet === 'A').byStation[0].station === 'x' &&
+  d4.rows.find((r) => r.outlet === 'A').delivered === 2 &&
+  d4.rows.find((r) => r.outlet === 'B').byStation[0].station === 'y' &&
+  d4.rows.find((r) => r.outlet === 'B').delivered === 3);
+
+// 放宽步行到 2：z 两跳可同时服务两出口，1 站即可（容量 10）
+const d4b = solver.planEmergencyDeliveryStations(delNet2, {
+  supplies: ['S'],
+  outlets: ['A', 'B'],
+  supplyCaps: { S: 0 },
+  outletDemands: { A: 2, B: 3 },
+  passage: delPassage2,
+  maxWalkMinutes: 2,
+  outletWaypoints: { A: 'wA', B: 'wB' },
+  stations: [
+    { name: 'z', capacity: 10 },
+    { name: 'y', capacity: 5 },
+    { name: 'x', capacity: 5 },
+  ],
+});
+check('放宽步行后单站 z 可补齐（最短步行按通道计算）', d4b.status === 'ok' &&
+  d4b.stationUsed === 1 && d4b.stations[0].name === 'z' && d4b.totalDelivered === 5);
+
+// 容量共享：两出口都只由一站 z 服务，其容量 4 < 总缺口 5 → unsolvable
+const d5 = solver.planEmergencyDeliveryStations(delNet2, {
+  supplies: ['S'],
+  outlets: ['A', 'B'],
+  supplyCaps: { S: 0 },
+  outletDemands: { A: 2, B: 3 },
+  passage: delPassage2,
+  maxWalkMinutes: 2,
+  outletWaypoints: { A: 'wA', B: 'wB' },
+  stations: [{ name: 'z', capacity: 4 }],
+});
+check('单站容量被多出口共享：送 4 后仍缺', d5.status === 'unsolvable' &&
+  d5.totalDelivered === 4 && d5.uncoveredOutlets.length >= 1);
+
+console.log('应急送水站布点：缺口为 0 与校验：');
+// 无缺口：需求 0（或供给充足）→ empty
+const d6 = solver.planEmergencyDeliveryStations(delNet, {
+  ...delBase,
+  outletDemands: { O: 0 },
+  stations: [],
+  maxWalkMinutes: 6,
+  outletWaypoints: {},
+});
+check('缺口全为 0 返回 empty（无需布点）', d6.status === 'empty');
+
+const d7 = solver.planEmergencyDeliveryStations(delNet, {
+  ...delBase,
+  stations: [{ name: 'ghost', capacity: 1 }],
+});
+check('站路点未在 waypoints 声明报错', d7.status === 'invalid' &&
+  d7.errors.some((e) => e.includes('ghost')));
+
+const d8 = solver.planEmergencyDeliveryStations(delNet, {
+  ...delBase,
+  stations: [{ name: 'gate', capacity: 1 }],
+  outletWaypoints: {},
+});
+check('缺口出口缺少路点映射报错', d8.status === 'invalid' &&
+  d8.errors.some((e) => e.includes('O')));
+
+const d9Passage = {
+  waypoints: Array.from({ length: 9 }, (_, i) => `w${i}`),
+  passages: [],
+  valveWaypoints: {},
+};
+const d9 = solver.planEmergencyDeliveryStations(delNet, {
+  ...delBase,
+  passage: d9Passage,
+  outletWaypoints: { O: 'oport' },
+  stations: Array.from({ length: 9 }, (_, i) => ({ name: `w${i}`, capacity: 1 })),
+});
+check('候选站超过 8 个被拒绝', d9.status === 'invalid' && d9.errors.some((e) => e.includes('8')));
+
+const d10 = solver.planEmergencyDeliveryStations(delNet, {
+  ...delBase,
+  stations: [{ name: 'gate', capacity: 2.5 }],
+});
+check('可送水量为小数被拒绝', d10.status === 'invalid' &&
+  d10.errors.some((e) => e.includes('非负整数')));
+
+const d11 = solver.planEmergencyDeliveryStations(delNet, {
+  ...delBase,
+  stations: [{ name: 'gate', capacity: 5 }],
+  maxWalkMinutes: -1,
+});
+check('最大步行分钟为负数被拒绝', d11.status === 'invalid' &&
+  d11.errors.some((e) => e.includes('最大步行分钟')));
+
+const d12 = solver.planEmergencyDeliveryStations(delNet, {
+  ...delBase,
+  stations: [{ name: 'gate', capacity: 5 }, { name: 'gate', capacity: 2 }],
+});
+check('候选站重复被拒绝', d12.status === 'invalid' && d12.errors.some((e) => e.includes('重复')));
+
+const beforeDelNet = JSON.stringify(delNet);
+const beforeDelPsg = JSON.stringify(delPassage);
+const delStationsInput = [{ name: 'gate', capacity: 5 }];
+solver.planEmergencyDeliveryStations(delNet, { ...delBase, stations: delStationsInput });
+check('布点测算不修改拓扑', JSON.stringify(delNet) === beforeDelNet);
+check('布点测算不修改作业通道输入', JSON.stringify(delPassage) === beforeDelPsg);
+check('布点测算不修改候选站入参数组', delStationsInput[0].capacity === 5 && delStationsInput.length === 1);
+
+// 供水能力填写表本身无效时透传校验错误
+const d13 = solver.planEmergencyDeliveryStations(delNet, {
+  supplies: ['S'],
+  outlets: ['NOPE'],
+  supplyCaps: { S: 5 },
+  outletDemands: { NOPE: 3 },
+  passage: delPassage,
+  maxWalkMinutes: 6,
+  outletWaypoints: { NOPE: 'oport' },
+  stations: [{ name: 'gate', capacity: 5 }],
+});
+check('出口节点不存在时透传核验错误', d13.status === 'invalid');
+
 console.log(`\n${passed} 通过, ${failed} 失败`);
 process.exit(failed > 0 ? 1 : 0);

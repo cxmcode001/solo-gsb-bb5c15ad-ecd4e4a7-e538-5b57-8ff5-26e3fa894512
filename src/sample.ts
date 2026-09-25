@@ -95,6 +95,7 @@ export const SAMPLE_WORK_PASSAGE = {
     'S2水箱间',
     '展厅B检修口',
     '卫生间检修口',
+    '咖啡厅取水口',
   ],
   passages: [
     { id: 'W01', from: '检修大门', to: '路口甲', minutes: 3 },
@@ -110,6 +111,7 @@ export const SAMPLE_WORK_PASSAGE = {
     { id: 'W11', from: '环管N4井位', to: 'S2水箱间', minutes: 2 },
     { id: 'W12', from: '环管N4井位', to: '展厅B检修口', minutes: 3 },
     { id: 'W13', from: '路口乙', to: '环管N3井位', minutes: 4 },
+    { id: 'W14', from: '环管N3井位', to: '咖啡厅取水口', minutes: 2 },
   ],
   valveWaypoints: {
     V01: 'S1泵房',
@@ -126,3 +128,37 @@ export const SAMPLE_WORK_PASSAGE = {
 
 /** 示例关阀作业路线：出发路点。 */
 export const SAMPLE_ROUTE_START = '检修大门';
+
+/**
+ * 示例应急送水站布点：候选送水站路点（每个路点最多一个站）。
+ * 供水能力核验下示例总获配为 2、总缺口为 3：展厅B / 咖啡厅 / 卫生间各缺 1。
+ */
+export const SAMPLE_DELIVERY_STATIONS: string[] = [
+  '环管N1井位',
+  '环管N3井位',
+  '环管N4井位',
+  '检修大门',
+];
+
+/** 示例应急送水站布点：各候选站可送水量（非负整数）。 */
+export const SAMPLE_DELIVERY_CAPS: Record<string, number> = {
+  环管N1井位: 3,
+  环管N3井位: 3,
+  环管N4井位: 3,
+  检修大门: 3,
+};
+
+/** 示例应急送水站布点：送水员最大步行分钟。 */
+export const SAMPLE_DELIVERY_MAX_WALK = 6;
+
+/**
+ * 示例应急送水站布点：有缺口保供出口 → 取水口路点映射。
+ * 最大步行 6 分钟内：环管N1井位可送展厅B；环管N3井位可送卫生间与咖啡厅；
+ * 环管N4井位可送展厅B；检修大门任何出口都不可达。
+ * 最少需 2 个站，同数按站名升序列表字典序推荐：环管N1井位 + 环管N3井位。
+ */
+export const SAMPLE_OUTLET_WAYPOINTS: Record<string, string> = {
+  展厅B: '展厅B检修口',
+  咖啡厅: '咖啡厅取水口',
+  卫生间: '卫生间检修口',
+};
